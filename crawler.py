@@ -6,8 +6,8 @@ from dataclasses import dataclass
 import time
 from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
-from urllib.robotparser import RobotFileParser
 
+from protego import Protego
 import requests
 
 
@@ -135,7 +135,7 @@ def robots_allowed(
     url: str,
     session: requests.Session,
     limiter: RateLimiter,
-    cache: dict[str, RobotFileParser | None],
+    cache: dict[str, Protego | None],
     redirect_hosts: set[str],
     timeout: float,
 ) -> bool:
@@ -143,7 +143,7 @@ def robots_allowed(
     origin = origin_for(url)
     if origin in cache:
         parser = cache[origin]
-        return parser is None or parser.can_fetch(ROBOTS_USER_AGENT, url)
+        return parser is None or parser.can_fetch(url, ROBOTS_USER_AGENT)
 
     robots_url = f"{origin}/robots.txt"
     visited: set[str] = set()
@@ -161,11 +161,9 @@ def robots_allowed(
         with response:
             status = response.status_code
             if status == 200:
-                parser = RobotFileParser()
-                parser.set_url(robots_url)
-                parser.parse(_read_robots_body(response).splitlines())
+                parser = Protego.parse(_read_robots_body(response))
                 cache[origin] = parser
-                return parser.can_fetch(ROBOTS_USER_AGENT, url)
+                return parser.can_fetch(url, ROBOTS_USER_AGENT)
 
             if 400 <= status <= 499:
                 cache[origin] = None
