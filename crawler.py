@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
+from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.robotparser import RobotFileParser
+
+import requests
 
 
 USER_AGENT = "LegacySiteInventoryBot/1.0"
@@ -14,6 +19,7 @@ MAX_PAGES = 3000
 MAX_DEPTH = 10
 MAX_REDIRECTS = 5
 MAX_HTML_BYTES = 5 * 1024 * 1024
+ROBOTS_MAX_BYTES = 512 * 1024
 
 CSV_FIELDS = [
     "url",
@@ -62,6 +68,124 @@ class CrawlSummary:
     depth_limited: int
     page_limited: int
     csv_path: str
+
+
+class RobotsUnavailableError(RuntimeError):
+    """Raised when robots.txt cannot be fetched safely."""
+
+
+class RateLimiter:
+    """Enforce a minimum interval between request start times."""
+
+    def __init__(
+        self,
+        delay: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.delay = max(0.0, delay)
+        self._clock = clock
+        self._sleeper = sleeper
+        self._last_request_started: float | None = None
+
+    def wait(self) -> None:
+        now = self._clock()
+        if self._last_request_started is not None:
+            remaining = self.delay - (now - self._last_request_started)
+            if remaining > 0:
+                self._sleeper(remaining)
+                now = self._clock()
+        self._last_request_started = now
+
+
+def request_once(
+    session: requests.Session,
+    url: str,
+    limiter: RateLimiter,
+    timeout: float,
+) -> requests.Response:
+    """Send one rate-limited GET without following redirects."""
+    limiter.wait()
+    return session.get(
+        url,
+        headers={"User-Agent": USER_AGENT},
+        timeout=(timeout, timeout),
+        allow_redirects=False,
+        stream=True,
+    )
+
+
+def _read_robots_body(response: requests.Response) -> str:
+    body = bytearray()
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        if not chunk:
+            continue
+        remaining = ROBOTS_MAX_BYTES - len(body)
+        if remaining <= 0:
+            break
+        body.extend(chunk[:remaining])
+        if len(body) >= ROBOTS_MAX_BYTES:
+            break
+    encoding = response.encoding or "utf-8"
+    return bytes(body).decode(encoding, errors="replace")
+
+
+def robots_allowed(
+    url: str,
+    session: requests.Session,
+    limiter: RateLimiter,
+    cache: dict[str, RobotFileParser | None],
+    redirect_hosts: set[str],
+    timeout: float,
+) -> bool:
+    """Return whether robots.txt permits a URL, caching by origin."""
+    origin = origin_for(url)
+    if origin in cache:
+        parser = cache[origin]
+        return parser is None or parser.can_fetch(ROBOTS_USER_AGENT, url)
+
+    robots_url = f"{origin}/robots.txt"
+    visited: set[str] = set()
+
+    for redirect_count in range(MAX_REDIRECTS + 1):
+        if robots_url in visited:
+            raise RobotsUnavailableError("robots.txt redirect loop")
+        visited.add(robots_url)
+
+        try:
+            response = request_once(session, robots_url, limiter, timeout)
+        except requests.RequestException as exc:
+            raise RobotsUnavailableError(f"robots.txt request failed: {exc}") from exc
+
+        with response:
+            status = response.status_code
+            if status == 200:
+                parser = RobotFileParser()
+                parser.set_url(robots_url)
+                parser.parse(_read_robots_body(response).splitlines())
+                cache[origin] = parser
+                return parser.can_fetch(ROBOTS_USER_AGENT, url)
+
+            if 400 <= status <= 499:
+                cache[origin] = None
+                return True
+
+            if 300 <= status <= 399:
+                location = response.headers.get("Location", "")
+                target = normalize_url(location, robots_url)
+                if target is None:
+                    raise RobotsUnavailableError("invalid robots.txt redirect")
+                if not is_allowed_host(target, redirect_hosts):
+                    raise RobotsUnavailableError("external robots.txt redirect")
+                if redirect_count >= MAX_REDIRECTS:
+                    raise RobotsUnavailableError("robots.txt redirect limit exceeded")
+                robots_url = target
+                continue
+
+            raise RobotsUnavailableError(f"robots.txt returned HTTP {status}")
+
+    raise RobotsUnavailableError("robots.txt redirect limit exceeded")
 
 
 def normalize_url(href: str, base_url: str | None = None) -> str | None:
