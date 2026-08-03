@@ -4,9 +4,9 @@
 
 **Goal:** Build a minimal single-threaded Python crawler that discovers static internal links from a home page, obeys robots.txt, records every discovered URL once, and exports a CSV asset inventory.
 
-**Architecture:** Keep all runtime behavior in one `crawler.py` file with small functions and dataclasses. Use a `deque` for BFS, a dictionary for first-discovery ordered results, Requests with automatic redirects disabled, Beautiful Soup for `2xx HTML` only, and `urllib.robotparser` for robots matching. Tests use `unittest` and a local HTTP server; no crawler framework or database is introduced.
+**Architecture:** Keep all runtime behavior in one `crawler.py` file with small functions and dataclasses. Use a `deque` for BFS, a dictionary for first-discovery ordered results, Requests with automatic redirects disabled, Beautiful Soup for `2xx HTML` only, and Protego for standards-compatible robots matching. Tests use `unittest` and a local HTTP server; no crawler framework or database is introduced.
 
-**Tech Stack:** Python 3.12, Requests 2.x, Beautiful Soup 4.x, Python standard-library `unittest`, `http.server`, `csv`, `urllib.parse`, and `urllib.robotparser`.
+**Tech Stack:** Python 3.12, Requests 2.x, Beautiful Soup 4.x, Protego 0.6.x, and Python standard-library `unittest`, `http.server`, `csv`, and `urllib.parse`.
 
 ## Global Constraints
 
@@ -24,7 +24,7 @@
 ## File Map
 
 - Create `crawler.py`: constants, dataclasses, URL helpers, rate limiting, robots handling, BFS, CSV, and CLI.
-- Create `requirements.txt`: Requests and Beautiful Soup runtime dependencies only.
+- Create `requirements.txt`: Requests, Beautiful Soup, and Protego runtime dependencies only.
 - Create `tests/__init__.py`: make test discovery predictable.
 - Create `tests/test_crawler.py`: unit and local-server acceptance tests.
 - Modify `README.md`: install, usage, output schema, behavior, and limitations.
@@ -163,6 +163,7 @@ git commit -m "feat: add crawler URL foundations"
 
 **Files:**
 - Modify: `crawler.py`
+- Modify: `requirements.txt`
 - Modify: `tests/test_crawler.py`
 
 **Interfaces:**
@@ -228,7 +229,7 @@ return session.get(
 )
 ```
 
-`robots_allowed()` caches policy by `origin_for(url)`. Fetch `<origin>/robots.txt` manually with at most `MAX_REDIRECTS` responses. Parse `200` with `RobotFileParser.parse()`, treat all `4xx` as allow-all, raise `RobotsUnavailableError` for `5xx`, network/timeout errors, invalid redirects, redirect loops, too many redirects, or a redirect outside `redirect_hosts`. Use `ROBOTS_USER_AGENT = "LegacySiteInventoryBot"` in `can_fetch()`.
+Add `protego>=0.6,<1` to `requirements.txt`. `robots_allowed()` caches policy by `origin_for(url)`. Fetch `<origin>/robots.txt` manually with at most `MAX_REDIRECTS` responses. Parse `200` with `Protego.parse(...)`, treat all `4xx` as allow-all, raise `RobotsUnavailableError` for `5xx`, network/timeout errors, invalid redirects, redirect loops, too many redirects, or a redirect outside `redirect_hosts`. Use `can_fetch(url, ROBOTS_USER_AGENT)` so the most specific matching `Allow` or `Disallow` rule wins.
 
 - [ ] **Step 4: Run focused and full tests**
 

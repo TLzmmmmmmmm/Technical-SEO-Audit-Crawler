@@ -20,7 +20,7 @@
 
 ## 3. 技术选型与文件结构
 
-使用 Python、Requests、Beautiful Soup 和 Python 标准库。项目保持最小结构：
+使用 Python、Requests、Beautiful Soup、Protego 和 Python 标准库。项目保持最小结构：
 
 ```text
 crawler.py
