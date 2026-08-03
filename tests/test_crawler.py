@@ -1,16 +1,22 @@
 from collections import Counter
+import csv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import socket
+import tempfile
 import threading
 import unittest
+from unittest import mock
 from urllib.parse import urlsplit
 
 import requests
 
 from crawler import (
+    CSV_FIELDS,
     RateLimiter,
     RobotsUnavailableError,
     USER_AGENT,
     allowed_hosts_for,
+    crawl,
     is_allowed_host,
     normalize_url,
     origin_for,
@@ -218,5 +224,233 @@ class RequestAndRobotsTests(unittest.TestCase):
         self.assertEqual(self.server.hits["/robots.txt"], 1)
 
 
+class _CrawlerTestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = urlsplit(self.path).path
+        self.server.hits[path] += 1
+
+        if path == "/disconnect":
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+            return
+
+        if path == "/robots.txt":
+            status = self.server.robots_status
+            headers = {"Content-Type": "text/plain; charset=utf-8"}
+            body = self.server.robots_body
+        else:
+            status, headers, body = self.server.routes.get(
+                path,
+                (404, {"Content-Type": "text/html; charset=utf-8"}, "not found"),
+            )
+
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
+    def log_message(self, format, *args):
+        return
+
+
+class CrawlerAcceptanceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.output_csv = f"{self.temp_dir.name}\\inventory.csv"
+
+        self.server = self.start_server()
+        self.addCleanup(self.stop_server, self.server)
+        self.secondary_server = self.start_server(robots_status=503)
+        self.addCleanup(self.stop_server, self.secondary_server)
+        self.configure_routes()
+
+    def start_server(self, *, robots_status=200):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CrawlerTestHandler)
+        server.hits = Counter()
+        server.routes = {}
+        server.robots_status = robots_status
+        server.robots_body = (
+            "User-agent: LegacySiteInventoryBot\n"
+            "Disallow: /private\n"
+        )
+        server.thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server.thread.start()
+        return server
+
+    @staticmethod
+    def stop_server(server):
+        server.shutdown()
+        server.server_close()
+        server.thread.join(timeout=2)
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def secondary_url(self, path):
+        return f"http://127.0.0.1:{self.secondary_server.server_port}{path}"
+
+    @staticmethod
+    def html(body):
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, body
+
+    def configure_routes(self):
+        self.server.routes.update(
+            {
+                "/": self.html(
+                    '<title> Home  Page </title>'
+                    '<a href="/about">About</a>'
+                    '<a href="/about#team">Duplicate</a>'
+                    '<a href="/about?utm_source=test">Tracked duplicate</a>'
+                    '<a href="/redirect">Redirect</a>'
+                    '<a href="/asset.pdf">PDF</a>'
+                    '<a href="/missing">Missing</a>'
+                    '<a href="/private">Private</a>'
+                    '<a href="http://example.invalid/out">External</a>'
+                ),
+                "/about": self.html("<title>About</title>"),
+                "/redirect": (302, {"Location": "/redirect-target"}, b""),
+                "/redirect-target": self.html("<title>Target</title>"),
+                "/asset.pdf": (200, {"Content-Type": "application/pdf"}, b"PDF"),
+                "/missing": (404, {"Content-Type": "text/html"}, '<a href="/hidden">x</a>'),
+                "/private": self.html("private"),
+                "/redirect-home": (302, {"Location": "/redirect-target"}, b""),
+                "/external-redirect-home": (
+                    302,
+                    {"Location": "http://example.invalid/out"},
+                    b"",
+                ),
+                "/external-redirect-index": self.html(
+                    '<a href="/external-redirect-home">redirect</a>'
+                ),
+                "/error-home": (
+                    404,
+                    {"Content-Type": "text/html"},
+                    '<a href="/linked-from-404">x</a>',
+                ),
+                "/failure-home": self.html(
+                    '<a href="/disconnect">bad</a><a href="/after-failure">good</a>'
+                ),
+                "/after-failure": self.html("ok"),
+                "/depth/0": self.html('<a href="/depth/1">one</a>'),
+                "/depth/1": self.html('<a href="/depth/2">two</a>'),
+                "/depth/2": self.html("too deep"),
+                "/page-limit-home": self.html(
+                    '<a href="/page-limit-one">one</a>'
+                    '<a href="/page-limit-two">two</a>'
+                ),
+                "/page-limit-one": self.html("one"),
+                "/page-limit-two": self.html("two"),
+                "/secondary-origin-home": self.html(
+                    f'<a href="{self.secondary_url("/blocked-by-unreachable-robots")}">bad robots</a>'
+                    '<a href="/queued-after-secondary">queued</a>'
+                ),
+                "/queued-after-secondary": self.html("queued"),
+                "/large-html": self.html(
+                    "x" * 64 + '<a href="/inside-large-html">hidden</a>'
+                ),
+                "/first-source-home": self.html(
+                    '<a href="/first-source">first</a><a href="/second-source">second</a>'
+                ),
+                "/first-source": self.html('<a href="/shared">shared</a>'),
+                "/second-source": self.html('<a href="/shared">shared</a>'),
+                "/shared": self.html("shared"),
+            }
+        )
+
+    def read_rows(self):
+        with open(self.output_csv, encoding="utf-8-sig", newline="") as handle:
+            return {row["url"]: row for row in csv.DictReader(handle)}
+
+    def run_crawl(self, path, **overrides):
+        options = {"delay": 0, "timeout": 1, "max_pages": 100, "max_depth": 10}
+        options.update(overrides)
+        return crawl(self.url(path), self.output_csv, **options)
+
+    def test_bfs_records_assets_once_and_obeys_robots(self):
+        summary = self.run_crawl("/")
+        rows = self.read_rows()
+
+        self.assertEqual(summary.completion_reason, "queue_exhausted")
+        self.assertEqual(self.server.hits["/about"], 1)
+        self.assertEqual(self.server.hits["/private"], 0)
+        self.assertEqual(rows[self.url("/private")]["error"], "robots_disallowed")
+        self.assertEqual(rows[self.url("/asset.pdf")]["content_type"], "application/pdf")
+        self.assertEqual(rows[self.url("/redirect")]["status_code"], "302")
+        self.assertNotIn("http://example.invalid/out", rows)
+        with open(self.output_csv, encoding="utf-8-sig", newline="") as handle:
+            all_rows = list(csv.DictReader(handle))
+        self.assertEqual(list(all_rows[0]), CSV_FIELDS)
+        self.assertEqual(len(all_rows), len({row["url"] for row in all_rows}))
+
+    def test_internal_redirect_target_keeps_depth(self):
+        self.run_crawl("/redirect-home")
+        self.assertEqual(self.read_rows()[self.url("/redirect-target")]["crawl_depth"], "0")
+
+    def test_external_redirect_is_recorded_but_target_is_not_added(self):
+        self.run_crawl("/external-redirect-index")
+        rows = self.read_rows()
+        source = rows[self.url("/external-redirect-home")]
+        self.assertEqual(source["final_url"], "http://example.invalid/out")
+        self.assertEqual(source["error"], "external_redirect")
+        self.assertNotIn("http://example.invalid/out", rows)
+
+    def test_error_page_html_does_not_produce_links(self):
+        self.run_crawl("/error-home")
+        self.assertNotIn(self.url("/linked-from-404"), self.read_rows())
+
+    def test_disconnected_request_is_recorded_and_queue_continues(self):
+        summary = self.run_crawl("/failure-home")
+        rows = self.read_rows()
+        self.assertIn(rows[self.url("/disconnect")]["error"], {"connection_error", "request_error"})
+        self.assertEqual(rows[self.url("/after-failure")]["status_code"], "200")
+        self.assertEqual(summary.completion_reason, "queue_exhausted")
+
+    def test_depth_limited_discovery_is_exported_without_request(self):
+        self.run_crawl("/depth/0", max_depth=1)
+        row = self.read_rows()[self.url("/depth/2")]
+        self.assertEqual(row["crawl_depth"], "2")
+        self.assertEqual(row["error"], "max_depth_exceeded")
+        self.assertEqual(self.server.hits["/depth/2"], 0)
+
+    def test_page_limited_queue_is_exported_without_request(self):
+        summary = self.run_crawl("/page-limit-home", max_pages=2)
+        rows = self.read_rows()
+        self.assertEqual(summary.completion_reason, "max_pages_reached")
+        self.assertEqual(rows[self.url("/page-limit-two")]["error"], "max_pages_reached")
+        self.assertEqual(self.server.hits["/page-limit-two"], 0)
+
+    def test_secondary_origin_robots_failure_stops_and_marks_queue(self):
+        summary = self.run_crawl("/secondary-origin-home")
+        rows = self.read_rows()
+        self.assertEqual(summary.completion_reason, "robots_unreachable")
+        self.assertEqual(
+            rows[self.secondary_url("/blocked-by-unreachable-robots")]["error"],
+            "robots_unreachable",
+        )
+        self.assertEqual(
+            rows[self.url("/queued-after-secondary")]["error"],
+            "crawl_stopped_robots_unreachable",
+        )
+
+    def test_oversized_html_is_recorded_without_parsing_links(self):
+        with mock.patch("crawler.MAX_HTML_BYTES", 32):
+            self.run_crawl("/large-html")
+        rows = self.read_rows()
+        self.assertEqual(rows[self.url("/large-html")]["error"], "html_too_large")
+        self.assertNotIn(self.url("/inside-large-html"), rows)
+
+    def test_first_source_url_wins(self):
+        self.run_crawl("/first-source-home")
+        self.assertEqual(
+            self.read_rows()[self.url("/shared")]["source_url"],
+            self.url("/first-source"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
+    crawl,

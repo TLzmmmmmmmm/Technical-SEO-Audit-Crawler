@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from collections import deque
+import csv
 from dataclasses import dataclass
+from pathlib import Path
 import time
 from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
+from bs4 import BeautifulSoup
 from protego import Protego
 import requests
 
@@ -20,6 +24,11 @@ MAX_DEPTH = 10
 MAX_REDIRECTS = 5
 MAX_HTML_BYTES = 5 * 1024 * 1024
 ROBOTS_MAX_BYTES = 512 * 1024
+RESPECT_ROBOTS_TXT = True
+FOLLOW_INTERNAL_REDIRECTS = True
+FOLLOW_EXTERNAL_REDIRECTS = False
+RECORD_FIRST_SOURCE_ONLY = True
+PARSE_HTML_ONLY = True
 
 CSV_FIELDS = [
     "url",
@@ -256,3 +265,275 @@ def origin_for(url: str) -> str:
         raise ValueError(f"Invalid HTTP(S) URL: {url!r}")
     parts = urlsplit(normalized)
     return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+
+
+def _response_content_type(response: requests.Response) -> str:
+    return response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+
+
+def extract_html(response: requests.Response) -> tuple[str, list[str], str | None]:
+    """Read a bounded HTML response and return its title and href values."""
+    body = bytearray()
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        if not chunk:
+            continue
+        body.extend(chunk)
+        if len(body) > MAX_HTML_BYTES:
+            return "", [], "html_too_large"
+
+    soup = BeautifulSoup(bytes(body), "html.parser")
+    title = ""
+    if soup.title is not None:
+        title = " ".join(soup.title.get_text(" ", strip=True).split())
+    links = [tag.get("href") for tag in soup.find_all("a", href=True)]
+    return title, links, None
+
+
+def _request_error(exc: requests.RequestException) -> str:
+    if isinstance(exc, requests.Timeout):
+        return "timeout"
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "tls_error"
+    if isinstance(exc, requests.ConnectionError):
+        return "connection_error"
+    return "request_error"
+
+
+def write_csv(results: dict[str, CrawlResult], output_path: str | Path) -> None:
+    """Write crawl results in first-discovery order using UTF-8 with BOM."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        for result in results.values():
+            writer.writerow({field: getattr(result, field) for field in CSV_FIELDS})
+
+
+def _summary(
+    results: dict[str, CrawlResult],
+    completion_reason: str,
+    requested_urls: int,
+    output_path: str | Path,
+) -> CrawlSummary:
+    values = list(results.values())
+    return CrawlSummary(
+        completion_reason=completion_reason,
+        discovered_urls=len(values),
+        requested_urls=requested_urls,
+        successful_responses=sum(
+            result.status_code is not None and 200 <= result.status_code < 300
+            for result in values
+        ),
+        redirects=sum(
+            result.status_code is not None and 300 <= result.status_code < 400
+            for result in values
+        ),
+        request_failures=sum(
+            result.error in {"timeout", "tls_error", "connection_error", "request_error"}
+            for result in values
+        ),
+        robots_disallowed=sum(result.error == "robots_disallowed" for result in values),
+        depth_limited=sum(result.error == "max_depth_exceeded" for result in values),
+        page_limited=sum(result.error == "max_pages_reached" for result in values),
+        csv_path=str(output_path),
+    )
+
+
+def crawl(
+    start_url: str,
+    output_path: str | Path,
+    *,
+    delay: float = REQUEST_DELAY,
+    timeout: float = REQUEST_TIMEOUT,
+    max_pages: int = MAX_PAGES,
+    max_depth: int = MAX_DEPTH,
+    session: requests.Session | None = None,
+) -> CrawlSummary:
+    """Crawl one site breadth-first and export every discovered URL."""
+    normalized_start = normalize_url(start_url)
+    results: dict[str, CrawlResult] = {}
+    queue: deque[CrawlItem] = deque()
+    seen: set[str] = set()
+    robots_cache: dict[str, Protego | None] = {}
+    limiter = RateLimiter(delay)
+    requested_urls = 0
+    completion_reason = ""
+    own_session = session is None
+    active_session = session or requests.Session()
+
+    def discover(url: str, source_url: str, depth: int, *, enqueue: bool = True) -> bool:
+        if url in seen:
+            return False
+        seen.add(url)
+        result = CrawlResult(url=url, source_url=source_url, crawl_depth=depth)
+        results[url] = result
+        if depth > max_depth:
+            result.error = "max_depth_exceeded"
+        elif enqueue:
+            queue.append(CrawlItem(url, source_url, depth))
+        return True
+
+    def discover_links(hrefs: list[str], page_url: str, depth: int, allowed_hosts: set[str]) -> None:
+        for href in hrefs:
+            target = normalize_url(href, page_url)
+            if target is None or not is_allowed_host(target, allowed_hosts):
+                continue
+            discover(target, page_url, depth + 1)
+
+    def mark_queue(error: str) -> None:
+        for item in queue:
+            if not results[item.url].error:
+                results[item.url].error = error
+
+    if normalized_start is None:
+        write_csv(results, output_path)
+        if own_session:
+            active_session.close()
+        return _summary(results, "start_url_failed", requested_urls, output_path)
+
+    discover(normalized_start, "", 0, enqueue=False)
+    current = CrawlItem(normalized_start, "", 0)
+    allowed_hosts: set[str] = set()
+    home_links: list[str] = []
+    redirect_count = 0
+
+    try:
+        while not completion_reason:
+            result = results[current.url]
+            if requested_urls >= max_pages:
+                result.error = "max_pages_reached"
+                completion_reason = "max_pages_reached"
+                break
+
+            try:
+                if RESPECT_ROBOTS_TXT and not robots_allowed(
+                    current.url,
+                    active_session,
+                    limiter,
+                    robots_cache,
+                    allowed_hosts_for(urlsplit(current.url).hostname or ""),
+                    timeout,
+                ):
+                    result.error = "robots_disallowed"
+                    completion_reason = "start_url_failed"
+                    break
+            except RobotsUnavailableError:
+                result.error = "robots_unreachable"
+                completion_reason = "robots_unreachable"
+                break
+
+            requested_urls += 1
+            try:
+                response = request_once(active_session, current.url, limiter, timeout)
+            except requests.RequestException as exc:
+                result.error = _request_error(exc)
+                completion_reason = "start_url_failed"
+                break
+
+            with response:
+                result.status_code = response.status_code
+                result.final_url = current.url
+                result.content_type = _response_content_type(response)
+
+                if 300 <= response.status_code < 400:
+                    target = normalize_url(response.headers.get("Location", ""), current.url)
+                    if target is None:
+                        result.error = "invalid_redirect"
+                        completion_reason = "start_url_failed"
+                        break
+                    result.final_url = target
+                    if redirect_count >= MAX_REDIRECTS or target in seen:
+                        completion_reason = "start_url_redirect_limit"
+                        break
+                    discover(target, current.url, 0, enqueue=False)
+                    current = CrawlItem(target, result.url, 0)
+                    redirect_count += 1
+                    continue
+
+                allowed_hosts = allowed_hosts_for(urlsplit(current.url).hostname or "")
+                if (
+                    200 <= response.status_code < 300
+                    and result.content_type in {"text/html", "application/xhtml+xml"}
+                ):
+                    result.title, home_links, html_error = extract_html(response)
+                    if html_error:
+                        result.error = html_error
+                completion_reason = "queue_exhausted"
+
+        if completion_reason == "queue_exhausted":
+            completion_reason = ""
+            discover_links(home_links, current.url, 0, allowed_hosts)
+
+        while not completion_reason and queue:
+            if requested_urls >= max_pages:
+                mark_queue("max_pages_reached")
+                completion_reason = "max_pages_reached"
+                break
+
+            item = queue.popleft()
+            result = results[item.url]
+            try:
+                if RESPECT_ROBOTS_TXT and not robots_allowed(
+                    item.url,
+                    active_session,
+                    limiter,
+                    robots_cache,
+                    allowed_hosts,
+                    timeout,
+                ):
+                    result.error = "robots_disallowed"
+                    continue
+            except RobotsUnavailableError:
+                result.error = "robots_unreachable"
+                mark_queue("crawl_stopped_robots_unreachable")
+                completion_reason = "robots_unreachable"
+                break
+
+            requested_urls += 1
+            try:
+                response = request_once(active_session, item.url, limiter, timeout)
+            except requests.RequestException as exc:
+                result.error = _request_error(exc)
+                continue
+
+            with response:
+                result.status_code = response.status_code
+                result.final_url = item.url
+                result.content_type = _response_content_type(response)
+
+                if 300 <= response.status_code < 400:
+                    target = normalize_url(response.headers.get("Location", ""), item.url)
+                    if target is None:
+                        result.error = "invalid_redirect"
+                    else:
+                        result.final_url = target
+                        if is_allowed_host(target, allowed_hosts):
+                            if FOLLOW_INTERNAL_REDIRECTS:
+                                discover(target, item.url, item.crawl_depth)
+                        elif not FOLLOW_EXTERNAL_REDIRECTS:
+                            result.error = "external_redirect"
+                    continue
+
+                if not 200 <= response.status_code < 300:
+                    continue
+                if result.content_type not in {"text/html", "application/xhtml+xml"}:
+                    continue
+
+                result.title, hrefs, html_error = extract_html(response)
+                if html_error:
+                    result.error = html_error
+                else:
+                    discover_links(hrefs, item.url, item.crawl_depth, allowed_hosts)
+
+        if not completion_reason:
+            completion_reason = "queue_exhausted"
+    except KeyboardInterrupt:
+        mark_queue("interrupted")
+        completion_reason = "interrupted"
+    finally:
+        write_csv(results, output_path)
+        if own_session:
+            active_session.close()
+
+    return _summary(results, completion_reason, requested_urls, output_path)
