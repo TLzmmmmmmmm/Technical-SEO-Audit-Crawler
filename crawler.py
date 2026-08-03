@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 from collections import deque
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 import time
 from typing import Callable
@@ -537,3 +538,77 @@ def crawl(
             active_session.close()
 
     return _summary(results, completion_reason, requested_urls, output_path)
+
+
+def _http_url(value: str) -> str:
+    normalized = normalize_url(value)
+    if normalized is None:
+        raise argparse.ArgumentTypeError("start_url must be an absolute HTTP or HTTPS URL")
+    return normalized
+
+
+def _positive_float(value: str) -> float:
+    number = float(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return number
+
+
+def _non_negative_float(value: str) -> float:
+    number = float(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("value must be zero or greater")
+    return number
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return number
+
+
+def _non_negative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("value must be zero or greater")
+    return number
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Create a CSV inventory of one website.")
+    parser.add_argument("start_url", type=_http_url, help="HTTP(S) home page to crawl")
+    parser.add_argument("--output", default="inventory.csv", help="output CSV path")
+    parser.add_argument("--delay", type=_non_negative_float, default=REQUEST_DELAY)
+    parser.add_argument("--timeout", type=_positive_float, default=REQUEST_TIMEOUT)
+    parser.add_argument("--max-pages", type=_positive_int, default=MAX_PAGES)
+    parser.add_argument("--max-depth", type=_non_negative_int, default=MAX_DEPTH)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    summary = crawl(
+        args.start_url,
+        args.output,
+        delay=args.delay,
+        timeout=args.timeout,
+        max_pages=args.max_pages,
+        max_depth=args.max_depth,
+    )
+    for field in fields(CrawlSummary):
+        print(f"{field.name}={getattr(summary, field.name)}")
+
+    if summary.completion_reason == "interrupted":
+        return 130
+    if summary.completion_reason in {
+        "robots_unreachable",
+        "start_url_failed",
+        "start_url_redirect_limit",
+    }:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

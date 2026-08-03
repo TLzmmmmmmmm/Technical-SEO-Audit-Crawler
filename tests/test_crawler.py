@@ -1,6 +1,8 @@
 from collections import Counter
+from contextlib import redirect_stdout
 import csv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import socket
 import tempfile
 import threading
@@ -18,6 +20,7 @@ from crawler import (
     allowed_hosts_for,
     crawl,
     is_allowed_host,
+    main,
     normalize_url,
     origin_for,
     request_once,
@@ -451,6 +454,69 @@ class CrawlerAcceptanceTests(unittest.TestCase):
         )
 
 
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.output_csv = f"{self.temp_dir.name}\\cli-inventory.csv"
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _CrawlerTestHandler)
+        self.server.hits = Counter()
+        self.server.robots_status = 404
+        self.server.robots_body = ""
+        self.server.routes = {
+            "/": (200, {"Content-Type": "text/html"}, "<title>CLI</title>"),
+        }
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.stop_server)
+
+    def stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def url(self, path="/"):
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def test_main_writes_csv_and_prints_summary(self):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = main(
+                [
+                    self.url(),
+                    "--output",
+                    self.output_csv,
+                    "--delay",
+                    "0",
+                    "--timeout",
+                    "1",
+                    "--max-pages",
+                    "100",
+                    "--max-depth",
+                    "10",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("completion_reason=queue_exhausted", stdout.getvalue())
+        self.assertIn(f"csv_path={self.output_csv}", stdout.getvalue())
+
+    def test_invalid_scheme_is_an_argparse_error_without_request(self):
+        with self.assertRaises(SystemExit) as raised:
+            main(["ftp://example.com/"])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(sum(self.server.hits.values()), 0)
+
+    def test_non_positive_page_limit_is_an_argparse_error_without_request(self):
+        with self.assertRaises(SystemExit) as raised:
+            main([self.url(), "--max-pages", "0"])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(sum(self.server.hits.values()), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
     crawl,
+    main,
