@@ -361,6 +361,12 @@ class CrawlerAcceptanceTests(unittest.TestCase):
                 "/first-source": self.html('<a href="/shared">shared</a>'),
                 "/second-source": self.html('<a href="/shared">shared</a>'),
                 "/shared": self.html("shared"),
+                "/interrupt-home": self.html(
+                    '<a href="/interrupt-active">active</a>'
+                    '<a href="/interrupt-queued">queued</a>'
+                ),
+                "/interrupt-active": self.html("active"),
+                "/interrupt-queued": self.html("queued"),
             }
         )
 
@@ -452,6 +458,22 @@ class CrawlerAcceptanceTests(unittest.TestCase):
             self.read_rows()[self.url("/shared")]["source_url"],
             self.url("/first-source"),
         )
+
+    def test_interrupt_marks_active_and_queued_urls(self):
+        real_request_once = request_once
+
+        def interrupt_active(session, url, limiter, timeout):
+            if url == self.url("/interrupt-active"):
+                raise KeyboardInterrupt
+            return real_request_once(session, url, limiter, timeout)
+
+        with mock.patch("crawler.request_once", side_effect=interrupt_active):
+            summary = self.run_crawl("/interrupt-home")
+
+        rows = self.read_rows()
+        self.assertEqual(summary.completion_reason, "interrupted")
+        self.assertEqual(rows[self.url("/interrupt-active")]["error"], "interrupted")
+        self.assertEqual(rows[self.url("/interrupt-queued")]["error"], "interrupted")
 
 
 class CliTests(unittest.TestCase):

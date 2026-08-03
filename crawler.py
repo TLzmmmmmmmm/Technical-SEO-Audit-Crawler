@@ -395,12 +395,14 @@ def crawl(
 
     discover(normalized_start, "", 0, enqueue=False)
     current = CrawlItem(normalized_start, "", 0)
+    active_url = current.url
     allowed_hosts: set[str] = set()
     home_links: list[str] = []
     redirect_count = 0
 
     try:
         while not completion_reason:
+            active_url = current.url
             result = results[current.url]
             if requested_urls >= max_pages:
                 result.error = "max_pages_reached"
@@ -473,6 +475,7 @@ def crawl(
                 break
 
             item = queue.popleft()
+            active_url = item.url
             result = results[item.url]
             try:
                 if RESPECT_ROBOTS_TXT and not robots_allowed(
@@ -530,6 +533,13 @@ def crawl(
         if not completion_reason:
             completion_reason = "queue_exhausted"
     except KeyboardInterrupt:
+        active_result = results.get(active_url)
+        if (
+            active_result is not None
+            and active_result.status_code is None
+            and not active_result.error
+        ):
+            active_result.error = "interrupted"
         mark_queue("interrupted")
         completion_reason = "interrupted"
     finally:
