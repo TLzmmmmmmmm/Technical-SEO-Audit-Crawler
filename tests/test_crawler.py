@@ -28,6 +28,30 @@ from crawler import (
 )
 
 
+EXPECTED_CSV_FIELDS = [
+    "url",
+    "status_code",
+    "final_url",
+    "title",
+    "canonical_url",
+    "canonical_self_reference",
+    "canonical_warning",
+    "meta_robots",
+    "x_robots_tag",
+    "source_url",
+    "source_tag",
+    "source_attribute",
+    "link_rel",
+    "discovery_count",
+    "crawl_depth",
+    "content_type",
+    "resource_type",
+    "indexable",
+    "indexability_reason",
+    "error",
+]
+
+
 class _PolicyTestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
@@ -74,6 +98,15 @@ class UrlNormalizationTests(unittest.TestCase):
             normalize_url("http://example.com/"),
             normalize_url("https://example.com/"),
         )
+
+    def test_sorts_query_names_but_preserves_repeated_value_order(self):
+        self.assertEqual(
+            normalize_url("https://example.com/?tag=b&x=1&tag=a"),
+            "https://example.com/?tag=b&tag=a&x=1",
+        )
+
+    def test_csv_fields_match_indexability_schema(self):
+        self.assertEqual(CSV_FIELDS, EXPECTED_CSV_FIELDS)
 
     def test_rejects_unsupported_or_invalid_links(self):
         for href in (
@@ -392,7 +425,7 @@ class CrawlerAcceptanceTests(unittest.TestCase):
         self.assertNotIn("http://example.invalid/out", rows)
         with open(self.output_csv, encoding="utf-8-sig", newline="") as handle:
             all_rows = list(csv.DictReader(handle))
-        self.assertEqual(list(all_rows[0]), CSV_FIELDS)
+        self.assertEqual(list(all_rows[0]), EXPECTED_CSV_FIELDS)
         self.assertEqual(len(all_rows), len({row["url"] for row in all_rows}))
 
     def test_internal_redirect_target_keeps_depth(self):
@@ -540,5 +573,3 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-    crawl,
-    main,

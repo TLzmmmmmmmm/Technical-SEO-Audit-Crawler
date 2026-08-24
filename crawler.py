@@ -36,9 +36,21 @@ CSV_FIELDS = [
     "status_code",
     "final_url",
     "title",
+    "canonical_url",
+    "canonical_self_reference",
+    "canonical_warning",
+    "meta_robots",
+    "x_robots_tag",
     "source_url",
+    "source_tag",
+    "source_attribute",
+    "link_rel",
+    "discovery_count",
     "crawl_depth",
     "content_type",
+    "resource_type",
+    "indexable",
+    "indexability_reason",
     "error",
 ]
 
@@ -60,9 +72,21 @@ class CrawlResult:
     status_code: int | None = None
     final_url: str = ""
     title: str = ""
+    canonical_url: str = ""
+    canonical_self_reference: str = ""
+    canonical_warning: str = ""
+    meta_robots: str = ""
+    x_robots_tag: str = ""
     source_url: str = ""
+    source_tag: str = ""
+    source_attribute: str = ""
+    link_rel: str = ""
+    discovery_count: int = 1
     crawl_depth: int = 0
     content_type: str = ""
+    resource_type: str = ""
+    indexable: str = ""
+    indexability_reason: str = ""
     error: str = ""
 
 
@@ -236,9 +260,14 @@ def normalize_url(href: str, base_url: str | None = None) -> str | None:
             continue
         filtered_query.append((name, value))
 
-    query = urlencode(sorted(filtered_query), doseq=True)
+    query = _stable_query(filtered_query)
     path = parts.path or "/"
     return urlunsplit((scheme, netloc, path, query, ""))
+
+
+def _stable_query(pairs: list[tuple[str, str]]) -> str:
+    """Sort query names while preserving the order of repeated values."""
+    return urlencode(sorted(pairs, key=lambda pair: pair[0]), doseq=True)
 
 
 def allowed_hosts_for(hostname: str) -> set[str]:
