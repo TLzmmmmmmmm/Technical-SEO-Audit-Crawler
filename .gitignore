@@ -1,4 +1,6 @@
 __pycache__/
 *.py[cod]
 .venv/
-inventory.csv
+*.csv
+*.txt
+!requirements.txt
