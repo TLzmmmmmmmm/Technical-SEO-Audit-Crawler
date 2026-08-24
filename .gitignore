@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+/docs/superpowers/
 *.csv
 *.txt
 !requirements.txt

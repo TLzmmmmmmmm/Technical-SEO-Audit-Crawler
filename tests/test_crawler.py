@@ -21,6 +21,7 @@ from crawler import (
     DiscoveredReference,
     HtmlDocument,
     RateLimiter,
+    ROBOTS_USER_AGENT,
     RobotsUnavailableError,
     USER_AGENT,
     apply_indexability,
@@ -595,7 +596,7 @@ class RequestAndRobotsTests(unittest.TestCase):
         self.server.last_user_agent = ""
         self.server.robots_status = 200
         self.server.robots_body = (
-            "User-agent: LegacySiteInventoryBot\n"
+            f"User-agent: {ROBOTS_USER_AGENT}\n"
             "Disallow: /private\n"
             "Allow: /private/public\n"
         )
@@ -751,7 +752,7 @@ class CrawlerAcceptanceTests(unittest.TestCase):
         server.routes = {}
         server.robots_status = robots_status
         server.robots_body = (
-            "User-agent: LegacySiteInventoryBot\n"
+            f"User-agent: {ROBOTS_USER_AGENT}\n"
             "Disallow: /private\n"
         )
         server.thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1044,7 +1045,7 @@ class IndexabilityAcceptanceTests(unittest.TestCase):
         self.server.hits = Counter()
         self.server.robots_status = 200
         self.server.robots_body = (
-            "User-agent: LegacySiteInventoryBot\nDisallow: /blocked-image.webp\n"
+            f"User-agent: {ROBOTS_USER_AGENT}\nDisallow: /blocked-image.webp\n"
         )
         self.server.routes = self.routes()
         self.server.thread = threading.Thread(
