@@ -14,15 +14,21 @@ import requests
 
 from crawler import (
     CSV_FIELDS,
+    CanonicalAudit,
+    CrawlResult,
     DiscoveredReference,
     HtmlDocument,
     RateLimiter,
     RobotsUnavailableError,
     USER_AGENT,
+    apply_indexability,
+    audit_canonical,
     allowed_hosts_for,
     crawl,
+    classify_resource,
     extract_html,
     is_allowed_host,
+    has_noindex,
     main,
     normalize_url,
     origin_for,
@@ -234,6 +240,167 @@ class HtmlExtractionTests(unittest.TestCase):
                 ),
             ],
         )
+
+
+class ResourceAuditTests(unittest.TestCase):
+    def test_classifies_response_mime_types_and_fallbacks(self):
+        cases = [
+            (("text/html; charset=utf-8", "/x", None), "html"),
+            (("application/xhtml+xml", "/x", None), "html"),
+            (("application/pdf", "/x", None), "pdf"),
+            (("image/webp", "/x", None), "image"),
+            (("text/css", "/x", None), "css"),
+            (("application/javascript", "/x", None), "javascript"),
+            (("font/woff2", "/x", None), "font"),
+            (("application/ld+json", "/x", None), "json"),
+            (("video/mp4", "/x", None), "media"),
+            (("application/octet-stream", "/x", None), "other"),
+            (("", "/document.pdf", None), "pdf"),
+            (("", "/font.woff2", None), "font"),
+            (("", "/unknown", None), "unknown"),
+            (
+                (
+                    "",
+                    "/download",
+                    DiscoveredReference(
+                        "/download", "link", "href", "preload", "font"
+                    ),
+                ),
+                "font",
+            ),
+        ]
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                self.assertEqual(classify_resource(*arguments), expected)
+
+    def test_noindex_matches_generic_directive_tokens_only(self):
+        self.assertTrue(has_noindex("index, NOINDEX, follow"))
+        self.assertTrue(has_noindex("index; noindex"))
+        self.assertFalse(has_noindex("not-noindex,follow"))
+        self.assertFalse(has_noindex("googlebot: noindex"))
+
+    def test_audits_missing_self_warning_other_and_conflicting_canonical(self):
+        missing = audit_canonical([], "https://example.com/products/")
+        self.assertEqual(missing, CanonicalAudit("", "N/A", "", ""))
+
+        self_reference = audit_canonical(
+            ["/products/?utm_source=test#details"],
+            "https://example.com/products/",
+        )
+        self.assertEqual(
+            self_reference,
+            CanonicalAudit(
+                "https://example.com/products/?utm_source=test",
+                "YES",
+                "Tracking parameters present; Fragment present",
+                "",
+            ),
+        )
+
+        other = audit_canonical(
+            ["https://example.com/other/"],
+            "https://example.com/products/",
+        )
+        self.assertEqual(other.self_reference, "NO")
+        self.assertEqual(other.blocker, "Canonicalized to another URL")
+
+        duplicate = audit_canonical(
+            ["/products/", "https://EXAMPLE.com:443/products/"],
+            "https://example.com/products/",
+        )
+        self.assertEqual(duplicate.self_reference, "YES")
+        self.assertEqual(duplicate.warning, "Multiple canonical tags")
+        self.assertEqual(duplicate.display_url, "https://example.com/products/")
+
+        conflicting = audit_canonical(
+            ["/products/", "/other/"],
+            "https://example.com/products/",
+        )
+        self.assertEqual(conflicting.self_reference, "NO")
+        self.assertEqual(conflicting.blocker, "Conflicting canonical tags")
+        self.assertEqual(
+            conflicting.display_url,
+            "https://example.com/products/; https://example.com/other/",
+        )
+
+    def test_canonical_comparison_uses_final_url_and_preserves_repeated_values(self):
+        self.assertEqual(
+            audit_canonical(
+                ["?tag=b&tag=a"], "https://example.com/page?tag=b&tag=a"
+            ).self_reference,
+            "YES",
+        )
+        self.assertEqual(
+            audit_canonical(
+                ["?tag=a&tag=b"], "https://example.com/page?tag=b&tag=a"
+            ).self_reference,
+            "NO",
+        )
+        self.assertEqual(
+            audit_canonical(
+                ["https://example.com/final/"], "https://example.com/final/"
+            ).self_reference,
+            "YES",
+        )
+
+    def test_applies_indexability_and_combines_blockers_in_fixed_order(self):
+        result = CrawlResult(
+            url="https://example.com/page",
+            final_url="https://example.com/page",
+            status_code=404,
+            resource_type="html",
+            meta_robots="noindex,follow",
+            x_robots_tag="noindex",
+            canonical_self_reference="NO",
+        )
+
+        apply_indexability(result, "Canonicalized to another URL")
+
+        self.assertEqual(result.indexable, "NO")
+        self.assertEqual(
+            result.indexability_reason,
+            "HTTP status 404; X-Robots-Tag noindex; Meta robots noindex; "
+            "Canonicalized to another URL",
+        )
+
+    def test_applies_yes_no_and_na_resource_rules(self):
+        cases = [
+            (CrawlResult("/html", status_code=200, resource_type="html"), "YES", "Canonical missing"),
+            (CrawlResult("/pdf", status_code=200, resource_type="pdf"), "YES", "OK"),
+            (
+                CrawlResult("/image", status_code=200, resource_type="image"),
+                "YES",
+                "Image resource allowed",
+            ),
+            (
+                CrawlResult("/css", status_code=200, resource_type="css"),
+                "N/A",
+                "Resource type not evaluated",
+            ),
+            (
+                CrawlResult(
+                    "/external",
+                    resource_type="javascript",
+                    error="external_resource_not_requested",
+                ),
+                "N/A",
+                "External resource not evaluated",
+            ),
+            (
+                CrawlResult(
+                    "/blocked",
+                    resource_type="image",
+                    error="robots_disallowed",
+                ),
+                "NO",
+                "Blocked by robots.txt",
+            ),
+        ]
+        for result, expected_indexable, expected_reason in cases:
+            with self.subTest(url=result.url):
+                apply_indexability(result)
+                self.assertEqual(result.indexable, expected_indexable)
+                self.assertEqual(result.indexability_reason, expected_reason)
 
 
 class RequestAndRobotsTests(unittest.TestCase):

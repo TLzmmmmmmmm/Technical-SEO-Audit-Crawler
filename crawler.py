@@ -7,6 +7,7 @@ from collections import deque
 import csv
 from dataclasses import dataclass, fields
 from pathlib import Path
+import re
 import time
 from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -77,6 +78,22 @@ IMAGE_EXTENSIONS = {
     ".svg",
     ".webp",
 }
+RESOURCE_EXTENSIONS = {
+    ".css": "css",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".pdf": "pdf",
+    ".json": "json",
+    ".woff": "font",
+    ".woff2": "font",
+    ".ttf": "font",
+    ".otf": "font",
+    ".eot": "font",
+    ".mp3": "media",
+    ".mp4": "media",
+    ".ogg": "media",
+    ".webm": "media",
+}
 
 
 @dataclass
@@ -101,6 +118,14 @@ class HtmlDocument:
     canonical_values: list[str]
     meta_robots: str
     references: list[DiscoveredReference]
+
+
+@dataclass(frozen=True)
+class CanonicalAudit:
+    display_url: str
+    self_reference: str
+    warning: str
+    blocker: str
 
 
 @dataclass
@@ -305,6 +330,212 @@ def normalize_url(href: str, base_url: str | None = None) -> str | None:
 def _stable_query(pairs: list[tuple[str, str]]) -> str:
     """Sort query names while preserving the order of repeated values."""
     return urlencode(sorted(pairs, key=lambda pair: pair[0]), doseq=True)
+
+
+def _is_tracking_query_name(name: str) -> bool:
+    lowered_name = name.lower()
+    return lowered_name in TRACKING_QUERY_NAMES or any(
+        lowered_name.startswith(prefix) for prefix in TRACKING_QUERY_PREFIXES
+    )
+
+
+def _canonical_normalization(
+    value: str, final_url: str
+) -> tuple[str, str, list[str]] | None:
+    """Return a canonical display URL, comparison key, and warnings."""
+    candidate = value.strip()
+    if not candidate:
+        return None
+    resolved = urljoin(final_url, candidate)
+    parts = urlsplit(resolved)
+    scheme = parts.scheme.lower()
+    if scheme not in ALLOWED_SCHEMES or not parts.hostname:
+        return None
+    if parts.username is not None or parts.password is not None:
+        return None
+
+    hostname = parts.hostname.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    host_for_netloc = f"[{hostname}]" if ":" in hostname else hostname
+    default_port = (scheme == "http" and port == 80) or (
+        scheme == "https" and port == 443
+    )
+    netloc = host_for_netloc
+    if port is not None and not default_port:
+        netloc = f"{host_for_netloc}:{port}"
+
+    query_pairs = parse_qsl(parts.query, keep_blank_values=True)
+    display_query = _stable_query(query_pairs)
+    comparison_query = _stable_query(
+        [(name, value) for name, value in query_pairs if not _is_tracking_query_name(name)]
+    )
+    path = parts.path or "/"
+    display_url = urlunsplit((scheme, netloc, path, display_query, ""))
+    comparison_key = urlunsplit((scheme, netloc, path, comparison_query, ""))
+    warnings = []
+    if any(_is_tracking_query_name(name) for name, _ in query_pairs):
+        warnings.append("Tracking parameters present")
+    if parts.fragment:
+        warnings.append("Fragment present")
+    return display_url, comparison_key, warnings
+
+
+def audit_canonical(values: list[str], final_url: str) -> CanonicalAudit:
+    """Evaluate canonical tags against the response's final URL."""
+    if not values:
+        return CanonicalAudit("", "N/A", "", "")
+
+    normalized_values = []
+    warnings = []
+    for value in values:
+        normalized = _canonical_normalization(value, final_url)
+        if normalized is None:
+            display = "; ".join(dict.fromkeys(item.strip() for item in values))
+            return CanonicalAudit(display, "NO", "", "Invalid canonical URL")
+        display_url, comparison_key, value_warnings = normalized
+        normalized_values.append((display_url, comparison_key))
+        for warning in value_warnings:
+            if warning not in warnings:
+                warnings.append(warning)
+
+    unique_comparison_keys = list(
+        dict.fromkeys(comparison_key for _, comparison_key in normalized_values)
+    )
+    unique_display_urls = list(
+        dict.fromkeys(display_url for display_url, _ in normalized_values)
+    )
+    if len(unique_comparison_keys) > 1:
+        return CanonicalAudit(
+            "; ".join(unique_display_urls),
+            "NO",
+            "; ".join(warnings),
+            "Conflicting canonical tags",
+        )
+
+    if len(values) > 1:
+        warnings.append("Multiple canonical tags")
+
+    final_normalized = _canonical_normalization(final_url, final_url)
+    if final_normalized is None:
+        return CanonicalAudit(
+            unique_display_urls[0],
+            "NO",
+            "; ".join(dict.fromkeys(warnings)),
+            "Invalid final URL",
+        )
+    self_reference = unique_comparison_keys[0] == final_normalized[1]
+    return CanonicalAudit(
+        unique_display_urls[0],
+        "YES" if self_reference else "NO",
+        "; ".join(dict.fromkeys(warnings)),
+        "" if self_reference else "Canonicalized to another URL",
+    )
+
+
+def has_noindex(value: str) -> bool:
+    """Return whether generic robots directives contain an exact noindex token."""
+    return any(
+        token.strip().lower() == "noindex"
+        for token in re.split(r"[;,]", value)
+    )
+
+
+def classify_resource(
+    content_type: str,
+    url: str,
+    reference: DiscoveredReference | None = None,
+) -> str:
+    """Classify a response using its MIME type, then discovery hints and suffix."""
+    mime_type = content_type.split(";", 1)[0].strip().lower()
+    if mime_type in {"text/html", "application/xhtml+xml"}:
+        return "html"
+    if mime_type == "application/pdf":
+        return "pdf"
+    if mime_type.startswith("image/"):
+        return "image"
+    if mime_type == "text/css":
+        return "css"
+    if mime_type in {
+        "application/javascript",
+        "text/javascript",
+        "application/ecmascript",
+        "text/ecmascript",
+    }:
+        return "javascript"
+    if mime_type.startswith("font/") or mime_type in {
+        "application/font-woff",
+        "application/vnd.ms-fontobject",
+        "application/x-font-ttf",
+        "application/x-font-opentype",
+    }:
+        return "font"
+    if mime_type == "application/json" or mime_type.endswith("+json"):
+        return "json"
+    if mime_type.startswith(("audio/", "video/")):
+        return "media"
+    if mime_type:
+        return "other"
+
+    if reference is not None and reference.resource_hint in {
+        "html",
+        "pdf",
+        "image",
+        "css",
+        "javascript",
+        "font",
+        "json",
+        "media",
+    }:
+        return reference.resource_hint
+    suffix = Path(urlsplit(url).path).suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        return "image"
+    return RESOURCE_EXTENSIONS.get(suffix, "unknown")
+
+
+def apply_indexability(result: CrawlResult, canonical_blocker: str = "") -> None:
+    """Populate indexability fields using the approved resource-specific rules."""
+    if result.error == "external_resource_not_requested":
+        result.indexable = "N/A"
+        result.indexability_reason = "External resource not evaluated"
+        return
+    if result.resource_type not in {"html", "pdf", "image"}:
+        result.indexable = "N/A"
+        result.indexability_reason = "Resource type not evaluated"
+        return
+    if result.error == "robots_disallowed":
+        result.indexable = "NO"
+        result.indexability_reason = "Blocked by robots.txt"
+        return
+
+    blockers = []
+    if result.status_code is None:
+        blockers.append("HTTP status unavailable")
+    elif result.status_code != 200:
+        blockers.append(f"HTTP status {result.status_code}")
+    if has_noindex(result.x_robots_tag):
+        blockers.append("X-Robots-Tag noindex")
+    if result.resource_type == "html":
+        if has_noindex(result.meta_robots):
+            blockers.append("Meta robots noindex")
+        if canonical_blocker:
+            blockers.append(canonical_blocker)
+
+    if blockers:
+        result.indexable = "NO"
+        result.indexability_reason = "; ".join(blockers)
+        return
+
+    result.indexable = "YES"
+    if result.resource_type == "image":
+        result.indexability_reason = "Image resource allowed"
+    elif result.resource_type == "html" and result.canonical_self_reference in {"", "N/A"}:
+        result.indexability_reason = "Canonical missing"
+    else:
+        result.indexability_reason = "OK"
 
 
 def allowed_hosts_for(hostname: str) -> set[str]:
