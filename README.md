@@ -1,8 +1,8 @@
-# Website Page and Resource Audit Crawler
+# Technical SEO Audit Crawler
 
-A lightweight technical SEO crawler that audits HTML pages and referenced web
-resources separately. It follows internal HTML pages breadth-first, checks
-embedded resources, and produces a focused Page Audit and Resource Audit.
+A lightweight technical SEO crawler that follows internal HTML pages
+breadth-first, audits referenced resources, and generates separate Page Audit
+and Resource Audit reports.
 
 > **Page count refers only to HTML documents. Images, CSS, JavaScript, PDFs,
 > and other assets are reported separately as resources.**
@@ -88,13 +88,7 @@ Run an audit:
 .\.venv\Scripts\python.exe crawler.py https://example.com/ --output-dir .\audit
 ```
 
-## Usage
-
-```powershell
-.\.venv\Scripts\python.exe crawler.py http://example.com/ --output-dir .\audit
-```
-
-Optional controls are `--delay`, `--timeout`, `--max-pages`, and `--max-depth`.
+Common options are `--delay`, `--timeout`, `--max-pages`, and `--max-depth`.
 Defaults are a 0.5 second request interval, 10 second timeout, 3,000 page
 requests, and depth 10. `--output-dir` defaults to the current directory. Every
 crawl writes:
@@ -146,30 +140,16 @@ kept in `indexable` and `indexability_reason`.
 
 The reports use `YES`, `NO`, and `N/A`:
 
-- HTML is `YES` when status is exactly 200, generic meta robots and generic
-  `X-Robots-Tag` contain no exact `noindex`, and canonical is missing or points
-  to the response's `final_url`.
-- PDF is `YES` when status is 200 and generic `X-Robots-Tag` has no `noindex`.
-- Image is `YES` when status is 200 and robots.txt and generic
-  `X-Robots-Tag` allow it.
+- HTML is `YES` when status is 200, generic robots directives contain no
+  `noindex`, and canonical is missing or self-equivalent to `final_url`.
+- PDF is `YES` when status is 200 and `X-Robots-Tag` permits indexing.
+- Image is `YES` when status is 200 and robots.txt and `X-Robots-Tag` permit it.
 - CSS, JavaScript, fonts, JSON, audio, video, other, and unknown resources are
   `N/A`.
-- A robots-blocked HTML/PDF/image is `NO`; an unevaluated external resource is
-  `N/A`.
 
-PDFs and images do not require canonical. Only generic robots directives are
-evaluated; crawler-scoped values such as `googlebot: noindex` are not treated as
-generic `noindex`. Multiple blockers are reported in status, robots,
-X-Robots-Tag, meta robots, canonical order.
-
-A missing HTML canonical is allowed and reported as `Canonical missing`.
-Canonical comparison uses `final_url`, preserves repeated query-value order,
-and ignores tracking parameters and fragments for equivalence. The displayed
-canonical retains tracking parameters but removes fragments. Non-blocking
-problems appear in `canonical_warning`, including `Tracking parameters present`,
-`Fragment present`, and `Multiple canonical tags`. A canonical pointing to a
-different URL, an invalid canonical, or conflicting canonical tags makes HTML
-`NO`.
+PDFs and images do not require canonical. See
+[`docs/indexability.md`](docs/indexability.md) for canonical normalization,
+robots directive handling, blocker precedence, and edge-case behavior.
 
 ## Crawl Behavior
 
@@ -236,7 +216,6 @@ reuse them for the following examples:
 ```powershell
 $pages = @(Import-Csv .\audit\pages.csv)
 $resources = @(Import-Csv .\audit\resources.csv)
-$allRows = $pages + $resources
 ```
 
 Replace `.\audit` with the directory passed to `--output-dir`.
@@ -268,181 +247,5 @@ $resources |
     Select-Object url, resource_type, status_code, error
 ```
 
-<details>
-<summary>More PowerShell analysis examples</summary>
-
-### Inspect the available fields
-
-Show every field and value from the first row:
-
-```powershell
-$pages | Select-Object -First 1 | Format-List *
-```
-
-Show selected fields as a table:
-
-```powershell
-$pages |
-    Select-Object url, status_code, indexable, indexability_reason |
-    Format-Table -AutoSize
-```
-
-### Extract one column
-
-Display only HTML page URLs:
-
-```powershell
-$pages | Select-Object -ExpandProperty url
-```
-
-Save one URL per line to `urls.txt`:
-
-```powershell
-$pages |
-    Select-Object -ExpandProperty url |
-    Set-Content .\urls.txt -Encoding UTF8
-```
-
-To keep a one-column CSV with its `url` header instead, use:
-
-```powershell
-$pages |
-    Select-Object url |
-    Export-Csv .\urls.csv -NoTypeInformation -Encoding UTF8
-```
-
-Use `$allRows` instead of `$pages` in either command when a list of every page
-and resource URL is required.
-
-### Find particular URLs
-
-Find an exact normalized URL:
-
-```powershell
-$allRows | Where-Object { $_.url -eq "https://example.com/products/" }
-```
-
-Find URLs containing a word or path segment. PowerShell's `-like` comparison is
-case-insensitive by default:
-
-```powershell
-$allRows |
-    Where-Object { $_.url -like "*/products/*" } |
-    Select-Object url, status_code, indexable, indexability_reason
-```
-
-Use `-match` for a regular-expression search, for example PDF or image URLs:
-
-```powershell
-$resources |
-    Where-Object { $_.url -match "\.(pdf|png|jpe?g|webp)(\?|$)" } |
-    Select-Object url, resource_type, status_code, indexable
-```
-
-### Filter indexability results
-
-Show every row that the crawler evaluated as non-indexable:
-
-```powershell
-$pages |
-    Where-Object { $_.indexable -eq "NO" } |
-    Select-Object url, status_code, indexability_reason, error |
-    Format-Table -AutoSize
-```
-
-Save those complete rows to another CSV for review in Excel:
-
-```powershell
-$pages |
-    Where-Object { $_.indexable -eq "NO" } |
-    Export-Csv .\non_indexable.csv -NoTypeInformation -Encoding UTF8
-```
-
-Find the common submission-ready subset: HTML pages with status 200 and
-`indexable=YES`. Because every `pages.csv` row is HTML, no `resource_type`
-condition is needed:
-
-```powershell
-$pages |
-    Where-Object {
-        $_.status_code -eq "200" -and
-        $_.indexable -eq "YES"
-    } |
-    Select-Object url, final_url, title, canonical_url, indexability_reason
-```
-
-Find indexable HTML 200 pages whose canonical is missing:
-
-```powershell
-$pages |
-    Where-Object {
-        $_.status_code -eq "200" -and
-        $_.indexable -eq "YES" -and
-        $_.indexability_reason -eq "Canonical missing"
-    } |
-    Select-Object url, final_url, indexability_reason
-```
-
-Find rows with any canonical warning:
-
-```powershell
-$pages |
-    Where-Object {
-        -not [string]::IsNullOrWhiteSpace($_.canonical_warning)
-    } |
-    Select-Object url, canonical_url, canonical_warning
-```
-
-Find request or crawl errors independently from SEO conclusions:
-
-```powershell
-$allRows |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_.error) } |
-    Select-Object url, status_code, error
-```
-
-Find unavailable or failed resources:
-
-```powershell
-$resources |
-    Where-Object {
-        $_.status_code -ne "200" -or
-        -not [string]::IsNullOrWhiteSpace($_.error)
-    } |
-    Select-Object url, resource_type, status_code, error
-```
-
-### Count and summarize results
-
-Count HTML pages, resources, total unique URLs, and non-indexable pages:
-
-```powershell
-$pages.Count
-$resources.Count
-($pages.Count + $resources.Count)
-($pages | Where-Object { $_.indexable -eq "NO" }).Count
-```
-
-Summarize results by indexability value:
-
-```powershell
-$pages |
-    Group-Object indexable |
-    Sort-Object Name |
-    Select-Object Name, Count
-```
-
-Summarize the most common reasons for `NO`:
-
-```powershell
-$pages |
-    Where-Object { $_.indexable -eq "NO" } |
-    Group-Object indexability_reason |
-    Sort-Object Count -Descending |
-    Select-Object Count, Name
-```
-
-The generated `.csv` files and `urls.txt` are covered by this repository's
-`.gitignore`, so these local analysis results are not included in Git commits.
-
-</details>
+For additional filtering, export, and aggregation examples, see
+[`docs/powershell-analysis.md`](docs/powershell-analysis.md).
