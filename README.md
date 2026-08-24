@@ -38,6 +38,7 @@ Resources
   Images ............. 27
   CSS ................ 3
   JavaScript ......... 6
+  Other resources .... 4
 
 Output
   audit\pages.csv
@@ -46,8 +47,9 @@ Output
 Total unique URLs discovered: 82
 ```
 
-`pages.csv` answers which HTML pages are indexable. `resources.csv` identifies
-referenced assets and failures. Page totals refer only to HTML documents.
+`pages.csv` records HTML crawl results and indexability decisions.
+`resources.csv` identifies referenced assets and failures. Page totals refer
+only to HTML documents.
 
 ## Architecture
 
@@ -206,7 +208,8 @@ handling, and the command-line entry point.
 - Beautiful Soup 4 for HTML parsing
 - Protego for `robots.txt` rules
 - Standard-library `csv`, `urllib.parse`, `argparse`, and `unittest`
-- Windows PowerShell for setup, execution, and report analysis
+
+Tested primarily with Windows PowerShell.
 
 ## PowerShell Analysis Examples
 
