@@ -1,9 +1,11 @@
-# Website Asset Inventory and Indexability Crawler
+# Website Page and Resource Audit Crawler
 
-A small, single-threaded Python tool for developers to inventory a static
-HTTP(S) website and spot common technical blockers to indexing. It follows
-internal HTML pages breadth-first, records embedded resources, and writes an
-explainable CSV audit.
+A lightweight technical SEO crawler that audits HTML pages and referenced web
+resources separately. It follows internal HTML pages breadth-first, checks
+embedded resources, and produces a focused Page Audit and Resource Audit.
+
+> **Page count refers only to HTML documents. Images, CSS, JavaScript, PDFs,
+> and other assets are reported separately as resources.**
 
 This is a pre-deployment technical check. `indexable=YES` means the response
 passes this tool's approved status, robots directive, and canonical rules; it
@@ -24,13 +26,22 @@ never copy a Linux or WSL virtual environment.
 ## Usage
 
 ```powershell
-.\.venv\Scripts\python.exe crawler.py http://example.com/ --output inventory.csv
+.\.venv\Scripts\python.exe crawler.py http://example.com/ --output-dir .\audit
 ```
 
 Optional controls are `--delay`, `--timeout`, `--max-pages`, and `--max-depth`.
 Defaults are a 0.5 second request interval, 10 second timeout, 3,000 page
-requests, and depth 10. The command prints a `key=value` completion summary,
-including the stop reason and CSV path.
+requests, and depth 10. `--output-dir` defaults to the current directory. Every
+crawl writes:
+
+```text
+audit\pages.csv
+audit\resources.csv
+```
+
+The terminal summary reports discovered/indexable HTML pages first, then
+resource counts by type. `Total unique URLs discovered` is shown separately and
+means pages plus resources; it is not a page count.
 
 Run the tests with:
 
@@ -39,7 +50,8 @@ Run the tests with:
 ```
 
 CSV and TXT files are ignored by Git except for `requirements.txt`, so normal
-crawl outputs such as `inventory.csv` and `urls.txt` are not uploaded.
+crawl outputs such as `pages.csv`, `resources.csv`, and `urls.txt` are not
+uploaded.
 
 ## What is discovered
 
@@ -52,20 +64,30 @@ Every `srcset` candidate becomes an independent URL. Canonical links are SEO
 metadata, not resource rows. External `<a>` targets are ignored; external
 embedded resources receive a row but are never requested. Internal resources
 are requested once, but only successful HTML is parsed recursively. PDFs,
-images, CSS, JavaScript, fonts, JSON, media, and other responses are terminal.
+images, CSS, JavaScript, fonts, JSON, audio, video, and other responses are
+terminal.
 
-## CSV output
+## Page Audit and Resource Audit
 
-The UTF-8-with-BOM CSV preserves first-discovery order and contains:
+Both UTF-8-with-BOM reports preserve first-discovery order. `pages.csv` contains
+HTML records only, including redirects, 4xx/5xx pages, robots-blocked pages, and
+failed or limited HTML discoveries:
 
 ```text
-url,status_code,final_url,title,canonical_url,canonical_self_reference,canonical_warning,meta_robots,x_robots_tag,source_url,source_tag,source_attribute,link_rel,discovery_count,crawl_depth,content_type,resource_type,indexable,indexability_reason,error
+url,status_code,final_url,title,canonical_url,canonical_self_reference,canonical_warning,meta_robots,x_robots_tag,source_url,source_tag,source_attribute,link_rel,discovery_count,crawl_depth,content_type,indexable,indexability_reason,error
+```
+
+`resources.csv` contains all non-HTML discoveries without HTML-only SEO fields:
+
+```text
+url,status_code,final_url,resource_type,content_type,source_url,source_tag,source_attribute,link_rel,discovery_count,crawl_depth,indexable,indexability_reason,error
 ```
 
 First-discovery source metadata is retained. `discovery_count` starts at 1 and
-increments for every later reference. `resource_type` is selected from `html`,
-`pdf`, `image`, `css`, `javascript`, `font`, `json`, `media`, `other`, and
-`unknown`, preferring response Content-Type over discovery hints and extensions.
+increments for every later occurrence; it is not a unique-referring-page count.
+`resource_type` is selected from `pdf`, `image`, `css`, `javascript`, `font`,
+`json`, `audio`, `video`, `other`, and `unknown`, preferring response
+Content-Type over discovery hints and extensions.
 
 `error` is reserved for crawl/runtime conditions such as `timeout`,
 `robots_disallowed`, or `external_resource_not_requested`. SEO conclusions are
@@ -73,7 +95,7 @@ kept in `indexable` and `indexability_reason`.
 
 ## Indexability rules
 
-The CSV uses `YES`, `NO`, and `N/A`:
+The reports use `YES`, `NO`, and `N/A`:
 
 - HTML is `YES` when status is exactly 200, generic meta robots and generic
   `X-Robots-Tag` contain no exact `noindex`, and canonical is missing or points
@@ -81,7 +103,8 @@ The CSV uses `YES`, `NO`, and `N/A`:
 - PDF is `YES` when status is 200 and generic `X-Robots-Tag` has no `noindex`.
 - Image is `YES` when status is 200 and robots.txt and generic
   `X-Robots-Tag` allow it.
-- CSS, JavaScript, fonts, JSON, media, other, and unknown resources are `N/A`.
+- CSS, JavaScript, fonts, JSON, audio, video, other, and unknown resources are
+  `N/A`.
 - A robots-blocked HTML/PDF/image is `NO`; an unevaluated external resource is
   `N/A`.
 
@@ -101,44 +124,45 @@ different URL, an invalid canonical, or conflicting canonical tags makes HTML
 
 ## Finding and filtering CSV data in PowerShell
 
-PowerShell reads the CSV header as property names. Import the crawl result once
-from the repository directory and reuse it for the following examples:
+PowerShell reads CSV headers as property names. Import both reports once and
+reuse them for the following examples:
 
 ```powershell
-$rows = Import-Csv .\inventory.csv
+$pages = @(Import-Csv .\audit\pages.csv)
+$resources = @(Import-Csv .\audit\resources.csv)
+$allRows = $pages + $resources
 ```
 
-Replace `inventory.csv` with the path passed to `--output` if a different name
-was used.
+Replace `.\audit` with the directory passed to `--output-dir`.
 
 ### Inspect the available fields
 
 Show every field and value from the first row:
 
 ```powershell
-$rows | Select-Object -First 1 | Format-List *
+$pages | Select-Object -First 1 | Format-List *
 ```
 
 Show selected fields as a table:
 
 ```powershell
-$rows |
-    Select-Object url, status_code, resource_type, indexable, indexability_reason |
+$pages |
+    Select-Object url, status_code, indexable, indexability_reason |
     Format-Table -AutoSize
 ```
 
 ### Extract one column
 
-Display only the URL values:
+Display only HTML page URLs:
 
 ```powershell
-$rows | Select-Object -ExpandProperty url
+$pages | Select-Object -ExpandProperty url
 ```
 
 Save one URL per line to `urls.txt`:
 
 ```powershell
-$rows |
+$pages |
     Select-Object -ExpandProperty url |
     Set-Content .\urls.txt -Encoding UTF8
 ```
@@ -146,24 +170,27 @@ $rows |
 To keep a one-column CSV with its `url` header instead, use:
 
 ```powershell
-$rows |
+$pages |
     Select-Object url |
     Export-Csv .\urls.csv -NoTypeInformation -Encoding UTF8
 ```
+
+Use `$allRows` instead of `$pages` in either command when a list of every page
+and resource URL is required.
 
 ### Find particular URLs
 
 Find an exact normalized URL:
 
 ```powershell
-$rows | Where-Object { $_.url -eq "https://example.com/products/" }
+$allRows | Where-Object { $_.url -eq "https://example.com/products/" }
 ```
 
 Find URLs containing a word or path segment. PowerShell's `-like` comparison is
 case-insensitive by default:
 
 ```powershell
-$rows |
+$allRows |
     Where-Object { $_.url -like "*/products/*" } |
     Select-Object url, status_code, indexable, indexability_reason
 ```
@@ -171,7 +198,7 @@ $rows |
 Use `-match` for a regular-expression search, for example PDF or image URLs:
 
 ```powershell
-$rows |
+$resources |
     Where-Object { $_.url -match "\.(pdf|png|jpe?g|webp)(\?|$)" } |
     Select-Object url, resource_type, status_code, indexable
 ```
@@ -181,26 +208,39 @@ $rows |
 Show every row that the crawler evaluated as non-indexable:
 
 ```powershell
-$rows |
+$pages |
     Where-Object { $_.indexable -eq "NO" } |
-    Select-Object url, status_code, resource_type, indexability_reason, error |
+    Select-Object url, status_code, indexability_reason, error |
     Format-Table -AutoSize
 ```
 
 Save those complete rows to another CSV for review in Excel:
 
 ```powershell
-$rows |
+$pages |
     Where-Object { $_.indexable -eq "NO" } |
     Export-Csv .\non_indexable.csv -NoTypeInformation -Encoding UTF8
 ```
 
-Find HTML pages that are indexable but have a missing canonical warning:
+Find the common submission-ready subset: HTML pages with status 200 and
+`indexable=YES`. Because every `pages.csv` row is HTML, no `resource_type`
+condition is needed:
 
 ```powershell
-$rows |
+$pages |
     Where-Object {
-        $_.resource_type -eq "html" -and
+        $_.status_code -eq "200" -and
+        $_.indexable -eq "YES"
+    } |
+    Select-Object url, final_url, title, canonical_url, indexability_reason
+```
+
+Find indexable HTML 200 pages whose canonical is missing:
+
+```powershell
+$pages |
+    Where-Object {
+        $_.status_code -eq "200" -and
         $_.indexable -eq "YES" -and
         $_.indexability_reason -eq "Canonical missing"
     } |
@@ -210,32 +250,47 @@ $rows |
 Find rows with any canonical warning:
 
 ```powershell
-$rows |
-    Where-Object { $_.canonical_warning -ne "" } |
+$pages |
+    Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_.canonical_warning)
+    } |
     Select-Object url, canonical_url, canonical_warning
 ```
 
 Find request or crawl errors independently from SEO conclusions:
 
 ```powershell
-$rows |
-    Where-Object { $_.error -ne "" } |
-    Select-Object url, status_code, resource_type, error
+$allRows |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_.error) } |
+    Select-Object url, status_code, error
+```
+
+Find unavailable or failed resources:
+
+```powershell
+$resources |
+    Where-Object {
+        $_.status_code -ne "200" -or
+        -not [string]::IsNullOrWhiteSpace($_.error)
+    } |
+    Select-Object url, resource_type, status_code, error
 ```
 
 ### Count and summarize results
 
-Count all discovered rows and all non-indexable rows:
+Count HTML pages, resources, total unique URLs, and non-indexable pages:
 
 ```powershell
-$rows.Count
-($rows | Where-Object { $_.indexable -eq "NO" }).Count
+$pages.Count
+$resources.Count
+($pages.Count + $resources.Count)
+($pages | Where-Object { $_.indexable -eq "NO" }).Count
 ```
 
 Summarize results by indexability value:
 
 ```powershell
-$rows |
+$pages |
     Group-Object indexable |
     Sort-Object Name |
     Select-Object Name, Count
@@ -244,7 +299,7 @@ $rows |
 Summarize the most common reasons for `NO`:
 
 ```powershell
-$rows |
+$pages |
     Where-Object { $_.indexable -eq "NO" } |
     Group-Object indexability_reason |
     Sort-Object Count -Descending |

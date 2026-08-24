@@ -4,11 +4,13 @@
 
 2026-08-24 资源清单与可索引性升级的详细决策见
 [`2026-08-24-indexability-resource-inventory-design.md`](2026-08-24-indexability-resource-inventory-design.md)。
+Page Audit / Resource Audit 双报告重构见
+[`2026-08-24-separated-page-resource-reports-design.md`](2026-08-24-separated-page-resource-reports-design.md)。
 本文已同步最终实现基线。
 
 ## 1. 目标
 
-实现一个最小可行的单站点爬虫，从用户提供的首页开始，通过静态 HTML 发现站内页面和嵌入资源，生成网站资产与可索引性清单 CSV，供开发者在部署前排查常见技术问题。
+实现一个最小可行的单站点爬虫，从用户提供的首页开始，通过静态 HTML 发现站内页面和嵌入资源，分别生成 HTML Page Audit 与非 HTML Resource Audit，供开发者在部署前排查常见技术问题。页面数量始终只表示 HTML 文档数量。
 
 程序不是通用爬虫框架。第一版不包含多线程、分布式抓取、登录、浏览器自动化、复杂断点恢复、数据库或图形界面。
 
@@ -142,7 +144,7 @@ HTML 正文最多读取 5 MiB。超过限制时记录 `html_too_large`，不解�
 
 资源分类优先使用响应 Content-Type，缺失时再使用发现标签、`rel`、`as` 和
 URL 扩展名，输出 `html`、`pdf`、`image`、`css`、`javascript`、`font`、
-`json`、`media`、`other` 或 `unknown`。所有内部资源使用 GET 且最多请求一次；
+`json`、`audio`、`video`、`other` 或 `unknown`。所有内部资源使用 GET 且最多请求一次；
 非 HTML 类型始终是终止行。
 
 ## 9. robots.txt
@@ -171,7 +173,11 @@ robots.txt 暂时不可达时，触发检查的 URL 标记 `robots_unreachable`�
 
 ## 11. CSV 输出
 
-CSV 使用 UTF-8 with BOM，按 URL 首次发现顺序输出以下字段：
+`--output-dir` 指定报告目录，默认当前目录。每次爬取均使用 UTF-8 with BOM
+生成两份报告，并在各自分区内保持 URL 首次发现顺序。
+
+`pages.csv` 只包含 HTML 文档，包括非 200、重定向、失败或未请求的 HTML
+记录；字段为：
 
 ```text
 url
@@ -190,11 +196,33 @@ link_rel
 discovery_count
 crawl_depth
 content_type
-resource_type
 indexable
 indexability_reason
 error
 ```
+
+`resources.csv` 包含所有非 HTML 记录；字段为：
+
+```text
+url
+status_code
+final_url
+resource_type
+content_type
+source_url
+source_tag
+source_attribute
+link_rel
+discovery_count
+crawl_depth
+indexable
+indexability_reason
+error
+```
+
+任何内部记录只进入其中一份报告。即使某个分区为空，也输出只有表头的 CSV。
+页面数定义为 `pages.csv` 的数据行数，图片、CSS、JavaScript、PDF、font、
+audio、video 和其他资源不得增加页面数。
 
 字段规则：
 
@@ -214,7 +242,7 @@ error
   `noindex` 指令，且 canonical 缺失或规范化后指向 `final_url`，则为 `YES`。
 - PDF：状态 200 且 generic X-Robots-Tag 无 `noindex`，不要求 canonical。
 - 图片：状态 200、robots.txt 允许且 generic X-Robots-Tag 无 `noindex`，不要求 canonical。
-- CSS、JavaScript、font、JSON、media、other、unknown 为 `N/A`；外部嵌入资源为 `N/A`。
+- CSS、JavaScript、font、JSON、audio、video、other、unknown 为 `N/A`；外部嵌入资源为 `N/A`。
 
 HTML canonical 缺失仍为 `YES`，原因是 `Canonical missing`。canonical 比较以
 `final_url` 为准；等价比较移除 tracking 参数和 fragment，但展示值保留 tracking
@@ -231,20 +259,18 @@ warning；冲突、无效或指向其他 URL 的 canonical 是 blocker。本工�
 - robots.txt 暂时不可达。
 - 用户按下 `Ctrl+C`。
 
-无论以何种原因结束，都导出当前已发现的全部结果。用户中断时，队列中尚未请求的记录标记 `interrupted`。控制台输出：
+无论以何种原因结束，都导出当前已发现的全部结果。用户中断时，队列中尚未请求的记录标记 `interrupted`。控制台首先输出 Page Audit 指标：
 
 ```text
-completion_reason
-discovered_urls
-requested_urls
-successful_responses
-redirects
-request_failures
-robots_disallowed
-depth_limited
-page_limited
-csv_path
+Pages discovered
+Indexable pages
+Non-indexable pages
+Page errors
 ```
+
+然后按 image、CSS、JavaScript、PDF、font、video、audio、other 输出资源数量与
+资源错误数，再显示 `pages.csv`、`resources.csv` 路径。页面加资源的总数仅以
+`Total unique URLs discovered` 作为次要指标显示，不得称为页面数。
 
 `completion_reason` 至少支持 `queue_exhausted`、`max_pages_reached`、`robots_unreachable`、`start_url_failed`、`start_url_redirect_limit` 和 `interrupted`。
 
@@ -265,6 +291,8 @@ csv_path
 - 图片/srcset、脚本、样式、字体、PDF 与外部嵌入资源发现和首次来源/重复次数。
 - Content-Type 优先的资源分类和非 HTML 终止递归。
 - HTML/PDF/图片的 indexability 矩阵、generic noindex、canonical 自引用和 warning。
+- HTML 200、重定向和 404 进入 `pages.csv`，非 HTML 与失败资源进入 `resources.csv`。
+- 两份报告 schema、不重叠分区、空报告表头和精准页面/资源摘要。
 - 404、500 或连接失败不终止队列。
 - 最大深度和最大页面数的记录行为。
 - CSV 字段、首次来源和 BFS 深度。
