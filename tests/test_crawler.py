@@ -822,6 +822,185 @@ class CrawlerAcceptanceTests(unittest.TestCase):
         self.assertNotIn("http://example.invalid/external-page", rows)
 
 
+class IndexabilityAcceptanceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.output_csv = f"{self.temp_dir.name}\\audit.csv"
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _CrawlerTestHandler)
+        self.server.hits = Counter()
+        self.server.robots_status = 200
+        self.server.robots_body = (
+            "User-agent: LegacySiteInventoryBot\nDisallow: /blocked-image.webp\n"
+        )
+        self.server.routes = self.routes()
+        self.server.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        )
+        self.server.thread.start()
+        self.addCleanup(self.stop_server)
+
+    def stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.server.thread.join(timeout=2)
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    @staticmethod
+    def html(body, **headers):
+        return 200, {"Content-Type": "text/html", **headers}, body
+
+    def routes(self):
+        page_links = "".join(
+            f'<a href="/{name}">{name}</a>'
+            for name in [
+                "self",
+                "missing-canonical",
+                "tracking",
+                "other-canonical",
+                "duplicate-canonical",
+                "conflicting-canonical",
+                "meta-noindex",
+                "x-noindex",
+                "multiple-blockers",
+                "document.pdf",
+                "document-noindex.pdf",
+                "not-found",
+            ]
+        )
+        resources = (
+            '<img src="/photo.webp">'
+            '<img src="/blocked-image.webp">'
+            '<link rel="stylesheet" href="/style.css">'
+            '<script src="/app.js"></script>'
+            '<link rel="preload" as="font" href="/font.woff2">'
+        )
+        return {
+            "/audit-home": self.html(page_links + resources),
+            "/self": self.html('<link rel="canonical" href="/self">'),
+            "/missing-canonical": self.html("missing"),
+            "/tracking": self.html(
+                '<link rel="canonical" href="/tracking?utm_source=test#details">'
+            ),
+            "/other-canonical": self.html(
+                '<link rel="canonical" href="/different">'
+            ),
+            "/duplicate-canonical": self.html(
+                '<link rel="canonical" href="/duplicate-canonical">'
+                '<link rel="canonical" href="/duplicate-canonical">'
+            ),
+            "/conflicting-canonical": self.html(
+                '<link rel="canonical" href="/conflicting-canonical">'
+                '<link rel="canonical" href="/different">'
+            ),
+            "/meta-noindex": self.html(
+                '<meta name="robots" content="noindex,follow">'
+            ),
+            "/x-noindex": self.html("x", **{"X-Robots-Tag": "noindex"}),
+            "/multiple-blockers": self.html(
+                '<meta name="robots" content="noindex">'
+                '<link rel="canonical" href="/different">',
+                **{"X-Robots-Tag": "noindex"},
+            ),
+            "/document.pdf": (200, {"Content-Type": "application/pdf"}, b"PDF"),
+            "/document-noindex.pdf": (
+                200,
+                {"Content-Type": "application/pdf", "X-Robots-Tag": "noindex"},
+                b"PDF",
+            ),
+            "/photo.webp": (200, {"Content-Type": "image/webp"}, b"image"),
+            "/blocked-image.webp": (
+                200,
+                {"Content-Type": "image/webp"},
+                b"blocked",
+            ),
+            "/style.css": (200, {"Content-Type": "text/css"}, b"body{}"),
+            "/app.js": (200, {"Content-Type": "application/javascript"}, b""),
+            "/font.woff2": (200, {"Content-Type": "font/woff2"}, b"font"),
+            "/not-found": (404, {"Content-Type": "text/html"}, "missing"),
+        }
+
+    def read_rows(self):
+        with open(self.output_csv, encoding="utf-8-sig", newline="") as handle:
+            return {row["url"]: row for row in csv.DictReader(handle)}
+
+    def test_exports_explainable_indexability_matrix(self):
+        crawl(
+            self.url("/audit-home"),
+            self.output_csv,
+            delay=0,
+            timeout=1,
+            max_pages=100,
+            max_depth=10,
+        )
+        rows = self.read_rows()
+
+        self.assertEqual(rows[self.url("/self")]["indexable"], "YES")
+        self.assertEqual(rows[self.url("/self")]["indexability_reason"], "OK")
+        self.assertEqual(
+            rows[self.url("/missing-canonical")]["indexability_reason"],
+            "Canonical missing",
+        )
+        tracking = rows[self.url("/tracking")]
+        self.assertEqual(tracking["canonical_self_reference"], "YES")
+        self.assertEqual(
+            tracking["canonical_url"], self.url("/tracking?utm_source=test")
+        )
+        self.assertEqual(
+            tracking["canonical_warning"],
+            "Tracking parameters present; Fragment present",
+        )
+        self.assertEqual(rows[self.url("/other-canonical")]["indexable"], "NO")
+        self.assertEqual(
+            rows[self.url("/other-canonical")]["indexability_reason"],
+            "Canonicalized to another URL",
+        )
+        self.assertEqual(
+            rows[self.url("/duplicate-canonical")]["canonical_warning"],
+            "Multiple canonical tags",
+        )
+        self.assertEqual(
+            rows[self.url("/conflicting-canonical")]["indexability_reason"],
+            "Conflicting canonical tags",
+        )
+        self.assertEqual(
+            rows[self.url("/meta-noindex")]["indexability_reason"],
+            "Meta robots noindex",
+        )
+        self.assertEqual(rows[self.url("/x-noindex")]["x_robots_tag"], "noindex")
+        self.assertEqual(
+            rows[self.url("/x-noindex")]["indexability_reason"],
+            "X-Robots-Tag noindex",
+        )
+        self.assertEqual(
+            rows[self.url("/multiple-blockers")]["indexability_reason"],
+            "X-Robots-Tag noindex; Meta robots noindex; "
+            "Canonicalized to another URL",
+        )
+        self.assertEqual(rows[self.url("/document.pdf")]["indexability_reason"], "OK")
+        self.assertEqual(
+            rows[self.url("/document-noindex.pdf")]["indexability_reason"],
+            "X-Robots-Tag noindex",
+        )
+        self.assertEqual(
+            rows[self.url("/photo.webp")]["indexability_reason"],
+            "Image resource allowed",
+        )
+        blocked_image = rows[self.url("/blocked-image.webp")]
+        self.assertEqual(blocked_image["resource_type"], "image")
+        self.assertEqual(blocked_image["indexable"], "NO")
+        self.assertEqual(blocked_image["indexability_reason"], "Blocked by robots.txt")
+        self.assertEqual(self.server.hits["/blocked-image.webp"], 0)
+        for path in ["/style.css", "/app.js", "/font.woff2"]:
+            self.assertEqual(rows[self.url(path)]["indexable"], "N/A")
+        self.assertEqual(
+            rows[self.url("/not-found")]["indexability_reason"],
+            "HTTP status 404",
+        )
+
+
 class CliTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()

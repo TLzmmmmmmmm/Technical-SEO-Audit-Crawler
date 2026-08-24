@@ -857,6 +857,18 @@ def crawl(
     def store_document(result: CrawlResult, document: HtmlDocument) -> None:
         result.title = document.title
         result.meta_robots = document.meta_robots
+        canonical = audit_canonical(document.canonical_values, result.final_url)
+        result.canonical_url = canonical.display_url
+        result.canonical_self_reference = canonical.self_reference
+        result.canonical_warning = canonical.warning
+        apply_indexability(result, canonical.blocker)
+
+    def finalize_results() -> None:
+        for result in results.values():
+            if result.resource_type == "html" and not result.canonical_self_reference:
+                result.canonical_self_reference = "N/A"
+            if not result.indexable:
+                apply_indexability(result)
 
     def mark_queue(error: str) -> None:
         for item in queue:
@@ -914,6 +926,7 @@ def crawl(
                 result.status_code = response.status_code
                 result.final_url = current.url
                 result.content_type = _response_content_type(response)
+                result.x_robots_tag = response.headers.get("X-Robots-Tag", "").strip()
                 classify_response(result)
 
                 if 300 <= response.status_code < 400:
@@ -991,6 +1004,7 @@ def crawl(
                 result.status_code = response.status_code
                 result.final_url = item.url
                 result.content_type = _response_content_type(response)
+                result.x_robots_tag = response.headers.get("X-Robots-Tag", "").strip()
                 classify_response(result)
 
                 if 300 <= response.status_code < 400:
@@ -1041,6 +1055,7 @@ def crawl(
         mark_queue("interrupted")
         completion_reason = "interrupted"
     finally:
+        finalize_results()
         write_csv(results, output_path)
         if own_session:
             active_session.close()
