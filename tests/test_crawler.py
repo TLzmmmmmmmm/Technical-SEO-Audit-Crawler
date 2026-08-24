@@ -14,15 +14,19 @@ import requests
 
 from crawler import (
     CSV_FIELDS,
+    DiscoveredReference,
+    HtmlDocument,
     RateLimiter,
     RobotsUnavailableError,
     USER_AGENT,
     allowed_hosts_for,
     crawl,
+    extract_html,
     is_allowed_host,
     main,
     normalize_url,
     origin_for,
+    parse_srcset,
     request_once,
     robots_allowed,
 )
@@ -146,6 +150,89 @@ class UrlNormalizationTests(unittest.TestCase):
         self.assertEqual(
             origin_for("http://Example.com:8080/a?x=1#part"),
             "http://example.com:8080",
+        )
+
+
+class HtmlExtractionTests(unittest.TestCase):
+    @staticmethod
+    def response_for(html):
+        response = requests.Response()
+        response.status_code = 200
+        response.headers["Content-Type"] = "text/html; charset=utf-8"
+        response.encoding = "utf-8"
+        response._content = html.encode("utf-8")
+        response._content_consumed = True
+        return response
+
+    def test_srcset_returns_each_url_without_its_descriptor(self):
+        self.assertEqual(
+            parse_srcset("a.webp 1x, b.webp 2x, /wide.webp 1200w"),
+            ["a.webp", "b.webp", "/wide.webp"],
+        )
+
+    def test_extracts_metadata_and_supported_resource_references(self):
+        response = self.response_for(
+            """
+            <html><head>
+              <title> Product   Page </title>
+              <meta name="robots" content="index, follow">
+              <meta name="ROBOTS" content="max-image-preview:large">
+              <meta name="googlebot" content="noindex">
+              <link rel="canonical" href="/page/">
+              <link rel="canonical" href="/other/">
+              <link rel="stylesheet" href="/style.css">
+              <link rel="alternate" href="/feed.xml">
+              <link rel="preconnect" href="https://cdn.example">
+              <link rel="preload" href="/font.woff2" as="font">
+            </head><body>
+              <a href="/next">Next</a>
+              <img src="/image.webp"
+                   srcset="/image.webp 1x, /image-2.webp 2x">
+              <source src="/fallback.webp"
+                      srcset="/small.webp 400w, /large.webp 1200w">
+              <script src="/app.js"></script>
+            </body></html>
+            """
+        )
+
+        document, error = extract_html(response)
+
+        self.assertIsNone(error)
+        self.assertIsInstance(document, HtmlDocument)
+        self.assertEqual(document.title, "Product Page")
+        self.assertEqual(
+            document.meta_robots,
+            "index, follow; max-image-preview:large",
+        )
+        self.assertEqual(document.canonical_values, ["/page/", "/other/"])
+        self.assertEqual(
+            document.references,
+            [
+                DiscoveredReference("/style.css", "link", "href", "stylesheet"),
+                DiscoveredReference(
+                    "/font.woff2", "link", "href", "preload", "font"
+                ),
+                DiscoveredReference("/next", "a", "href"),
+                DiscoveredReference("/image.webp", "img", "src", resource_hint="image"),
+                DiscoveredReference(
+                    "/image.webp", "img", "srcset", resource_hint="image"
+                ),
+                DiscoveredReference(
+                    "/image-2.webp", "img", "srcset", resource_hint="image"
+                ),
+                DiscoveredReference(
+                    "/fallback.webp", "source", "src", resource_hint="image"
+                ),
+                DiscoveredReference(
+                    "/small.webp", "source", "srcset", resource_hint="image"
+                ),
+                DiscoveredReference(
+                    "/large.webp", "source", "srcset", resource_hint="image"
+                ),
+                DiscoveredReference(
+                    "/app.js", "script", "src", resource_hint="javascript"
+                ),
+            ],
         )
 
 

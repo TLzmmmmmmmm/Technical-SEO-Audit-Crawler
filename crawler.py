@@ -57,6 +57,26 @@ CSV_FIELDS = [
 TRACKING_QUERY_NAMES = {"gclid", "fbclid", "msclkid"}
 TRACKING_QUERY_PREFIXES = ("utm_",)
 ALLOWED_SCHEMES = {"http", "https"}
+RESOURCE_LINK_RELS = {
+    "stylesheet",
+    "icon",
+    "apple-touch-icon",
+    "mask-icon",
+    "manifest",
+    "preload",
+    "modulepreload",
+}
+IMAGE_EXTENSIONS = {
+    ".avif",
+    ".bmp",
+    ".gif",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".svg",
+    ".webp",
+}
 
 
 @dataclass
@@ -64,6 +84,23 @@ class CrawlItem:
     url: str
     source_url: str
     crawl_depth: int
+
+
+@dataclass(frozen=True)
+class DiscoveredReference:
+    url: str
+    source_tag: str
+    source_attribute: str
+    link_rel: str = ""
+    resource_hint: str = ""
+
+
+@dataclass
+class HtmlDocument:
+    title: str
+    canonical_values: list[str]
+    meta_robots: str
+    references: list[DiscoveredReference]
 
 
 @dataclass
@@ -301,22 +338,120 @@ def _response_content_type(response: requests.Response) -> str:
     return response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
 
 
-def extract_html(response: requests.Response) -> tuple[str, list[str], str | None]:
-    """Read a bounded HTML response and return its title and href values."""
+def parse_srcset(value: str) -> list[str]:
+    """Return URL candidates from a srcset attribute."""
+    candidates = []
+    for item in value.split(","):
+        parts = item.strip().split()
+        if parts:
+            candidates.append(parts[0])
+    return candidates
+
+
+def _source_resource_hint(url: str, content_type: str) -> str:
+    lowered_type = content_type.lower()
+    if lowered_type.startswith("image/"):
+        return "image"
+    if lowered_type.startswith(("audio/", "video/")):
+        return "media"
+    if Path(urlsplit(url).path).suffix.lower() in IMAGE_EXTENSIONS:
+        return "image"
+    return ""
+
+
+def extract_html(
+    response: requests.Response,
+) -> tuple[HtmlDocument | None, str | None]:
+    """Read and parse one bounded HTML response."""
     body = bytearray()
     for chunk in response.iter_content(chunk_size=64 * 1024):
         if not chunk:
             continue
         body.extend(chunk)
         if len(body) > MAX_HTML_BYTES:
-            return "", [], "html_too_large"
+            return None, "html_too_large"
 
     soup = BeautifulSoup(bytes(body), "html.parser")
     title = ""
     if soup.title is not None:
         title = " ".join(soup.title.get_text(" ", strip=True).split())
-    links = [tag.get("href") for tag in soup.find_all("a", href=True)]
-    return title, links, None
+
+    meta_robots_values = []
+    for tag in soup.find_all("meta"):
+        name = tag.get("name", "")
+        if isinstance(name, str) and name.lower() == "robots" and tag.get("content"):
+            meta_robots_values.append(str(tag["content"]).strip())
+
+    canonical_values = []
+    references = []
+    for tag in soup.find_all(["a", "img", "script", "source", "link"]):
+        tag_name = tag.name.lower()
+        if tag_name == "link":
+            rel_tokens = [str(value).lower() for value in tag.get("rel", [])]
+            if "canonical" in rel_tokens and tag.get("href"):
+                canonical_values.append(str(tag["href"]))
+                continue
+            if not RESOURCE_LINK_RELS.intersection(rel_tokens) or not tag.get("href"):
+                continue
+            references.append(
+                DiscoveredReference(
+                    str(tag["href"]),
+                    "link",
+                    "href",
+                    " ".join(rel_tokens),
+                    str(tag.get("as", "")).lower(),
+                )
+            )
+            continue
+
+        if tag_name == "a" and tag.get("href"):
+            references.append(DiscoveredReference(str(tag["href"]), "a", "href"))
+            continue
+
+        if tag_name == "script" and tag.get("src"):
+            references.append(
+                DiscoveredReference(
+                    str(tag["src"]), "script", "src", resource_hint="javascript"
+                )
+            )
+            continue
+
+        if tag_name in {"img", "source"}:
+            hint = "image" if tag_name == "img" else ""
+            if tag.get("src"):
+                src = str(tag["src"])
+                references.append(
+                    DiscoveredReference(
+                        src,
+                        tag_name,
+                        "src",
+                        resource_hint=hint
+                        or _source_resource_hint(src, str(tag.get("type", ""))),
+                    )
+                )
+            if tag.get("srcset"):
+                for srcset_url in parse_srcset(str(tag["srcset"])):
+                    references.append(
+                        DiscoveredReference(
+                            srcset_url,
+                            tag_name,
+                            "srcset",
+                            resource_hint=hint
+                            or _source_resource_hint(
+                                srcset_url, str(tag.get("type", ""))
+                            ),
+                        )
+                    )
+
+    return (
+        HtmlDocument(
+            title=title,
+            canonical_values=canonical_values,
+            meta_robots="; ".join(meta_robots_values),
+            references=references,
+        ),
+        None,
+    )
 
 
 def _request_error(exc: requests.RequestException) -> str:
@@ -488,9 +623,16 @@ def crawl(
                     200 <= response.status_code < 300
                     and result.content_type in {"text/html", "application/xhtml+xml"}
                 ):
-                    result.title, home_links, html_error = extract_html(response)
+                    document, html_error = extract_html(response)
                     if html_error:
                         result.error = html_error
+                    elif document is not None:
+                        result.title = document.title
+                        home_links = [
+                            reference.url
+                            for reference in document.references
+                            if reference.source_tag == "a"
+                        ]
                 completion_reason = "queue_exhausted"
 
         if completion_reason == "queue_exhausted":
@@ -553,10 +695,16 @@ def crawl(
                 if result.content_type not in {"text/html", "application/xhtml+xml"}:
                     continue
 
-                result.title, hrefs, html_error = extract_html(response)
+                document, html_error = extract_html(response)
                 if html_error:
                     result.error = html_error
-                else:
+                elif document is not None:
+                    result.title = document.title
+                    hrefs = [
+                        reference.url
+                        for reference in document.references
+                        if reference.source_tag == "a"
+                    ]
                     discover_links(hrefs, item.url, item.crawl_depth, allowed_hosts)
 
         if not completion_reason:
