@@ -1,4 +1,4 @@
-"""Minimal single-site URL inventory crawler."""
+"""Technical SEO audit crawler for HTML pages and referenced resources."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ from protego import Protego
 import requests
 
 
-USER_AGENT = "LegacySiteInventoryBot/1.0"
-ROBOTS_USER_AGENT = "LegacySiteInventoryBot"
+USER_AGENT = "TechnicalSEOAuditCrawler/1.0"
+ROBOTS_USER_AGENT = "TechnicalSEOAuditCrawler"
 REQUEST_DELAY = 0.5
 REQUEST_TIMEOUT = 10
 MAX_PAGES = 3000
