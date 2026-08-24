@@ -490,6 +490,22 @@ def classify_resource(
         "media",
     }:
         return reference.resource_hint
+    if reference is not None:
+        if reference.source_tag == "a":
+            return "html"
+        if reference.source_tag in {"img", "source"}:
+            return "image"
+        if reference.source_tag == "script":
+            return "javascript"
+        rel_tokens = set(reference.link_rel.split())
+        if "stylesheet" in rel_tokens:
+            return "css"
+        if rel_tokens.intersection(
+            {"icon", "shortcut", "apple-touch-icon", "mask-icon"}
+        ):
+            return "image"
+        if "manifest" in rel_tokens:
+            return "json"
     suffix = Path(urlsplit(url).path).suffix.lower()
     if suffix in IMAGE_EXTENSIONS:
         return "image"
@@ -758,11 +774,37 @@ def crawl(
     own_session = session is None
     active_session = session or requests.Session()
 
-    def discover(url: str, source_url: str, depth: int, *, enqueue: bool = True) -> bool:
+    def discover(
+        url: str,
+        source_url: str,
+        depth: int,
+        *,
+        source_tag: str = "",
+        source_attribute: str = "",
+        link_rel: str = "",
+        resource_hint: str = "",
+        enqueue: bool = True,
+    ) -> bool:
         if url in seen:
+            results[url].discovery_count += 1
             return False
         seen.add(url)
-        result = CrawlResult(url=url, source_url=source_url, crawl_depth=depth)
+        reference = DiscoveredReference(
+            url,
+            source_tag,
+            source_attribute,
+            link_rel,
+            resource_hint,
+        )
+        result = CrawlResult(
+            url=url,
+            source_url=source_url,
+            source_tag=source_tag,
+            source_attribute=source_attribute,
+            link_rel=link_rel,
+            crawl_depth=depth,
+            resource_type=classify_resource("", url, reference),
+        )
         results[url] = result
         if depth > max_depth:
             result.error = "max_depth_exceeded"
@@ -770,12 +812,51 @@ def crawl(
             queue.append(CrawlItem(url, source_url, depth))
         return True
 
-    def discover_links(hrefs: list[str], page_url: str, depth: int, allowed_hosts: set[str]) -> None:
-        for href in hrefs:
-            target = normalize_url(href, page_url)
-            if target is None or not is_allowed_host(target, allowed_hosts):
+    def discover_references(
+        references: list[DiscoveredReference],
+        page_url: str,
+        depth: int,
+        allowed_hosts: set[str],
+    ) -> None:
+        for reference in references:
+            target = normalize_url(reference.url, page_url)
+            if target is None:
                 continue
-            discover(target, page_url, depth + 1)
+            internal = is_allowed_host(target, allowed_hosts)
+            if not internal and reference.source_tag == "a":
+                continue
+            discover(
+                target,
+                page_url,
+                depth + 1,
+                source_tag=reference.source_tag,
+                source_attribute=reference.source_attribute,
+                link_rel=reference.link_rel,
+                resource_hint=reference.resource_hint,
+                enqueue=internal,
+            )
+            if not internal:
+                external_result = results[target]
+                external_result.error = "external_resource_not_requested"
+                apply_indexability(external_result)
+
+    def classify_response(result: CrawlResult) -> None:
+        reference = DiscoveredReference(
+            result.url,
+            result.source_tag,
+            result.source_attribute,
+            result.link_rel,
+            result.resource_type,
+        )
+        result.resource_type = classify_resource(
+            result.content_type,
+            result.url,
+            reference,
+        )
+
+    def store_document(result: CrawlResult, document: HtmlDocument) -> None:
+        result.title = document.title
+        result.meta_robots = document.meta_robots
 
     def mark_queue(error: str) -> None:
         for item in queue:
@@ -788,11 +869,11 @@ def crawl(
             active_session.close()
         return _summary(results, "start_url_failed", requested_urls, output_path)
 
-    discover(normalized_start, "", 0, enqueue=False)
+    discover(normalized_start, "", 0, resource_hint="html", enqueue=False)
     current = CrawlItem(normalized_start, "", 0)
     active_url = current.url
     allowed_hosts: set[str] = set()
-    home_links: list[str] = []
+    home_references: list[DiscoveredReference] = []
     redirect_count = 0
 
     try:
@@ -833,6 +914,7 @@ def crawl(
                 result.status_code = response.status_code
                 result.final_url = current.url
                 result.content_type = _response_content_type(response)
+                classify_response(result)
 
                 if 300 <= response.status_code < 400:
                     target = normalize_url(response.headers.get("Location", ""), current.url)
@@ -844,7 +926,13 @@ def crawl(
                     if redirect_count >= MAX_REDIRECTS or target in seen:
                         completion_reason = "start_url_redirect_limit"
                         break
-                    discover(target, current.url, 0, enqueue=False)
+                    discover(
+                        target,
+                        current.url,
+                        0,
+                        resource_hint="html",
+                        enqueue=False,
+                    )
                     current = CrawlItem(target, result.url, 0)
                     redirect_count += 1
                     continue
@@ -858,17 +946,13 @@ def crawl(
                     if html_error:
                         result.error = html_error
                     elif document is not None:
-                        result.title = document.title
-                        home_links = [
-                            reference.url
-                            for reference in document.references
-                            if reference.source_tag == "a"
-                        ]
+                        store_document(result, document)
+                        home_references = document.references
                 completion_reason = "queue_exhausted"
 
         if completion_reason == "queue_exhausted":
             completion_reason = ""
-            discover_links(home_links, current.url, 0, allowed_hosts)
+            discover_references(home_references, current.url, 0, allowed_hosts)
 
         while not completion_reason and queue:
             if requested_urls >= max_pages:
@@ -907,6 +991,7 @@ def crawl(
                 result.status_code = response.status_code
                 result.final_url = item.url
                 result.content_type = _response_content_type(response)
+                classify_response(result)
 
                 if 300 <= response.status_code < 400:
                     target = normalize_url(response.headers.get("Location", ""), item.url)
@@ -916,7 +1001,12 @@ def crawl(
                         result.final_url = target
                         if is_allowed_host(target, allowed_hosts):
                             if FOLLOW_INTERNAL_REDIRECTS:
-                                discover(target, item.url, item.crawl_depth)
+                                discover(
+                                    target,
+                                    item.url,
+                                    item.crawl_depth,
+                                    resource_hint="html",
+                                )
                         elif not FOLLOW_EXTERNAL_REDIRECTS:
                             result.error = "external_redirect"
                     continue
@@ -930,13 +1020,13 @@ def crawl(
                 if html_error:
                     result.error = html_error
                 elif document is not None:
-                    result.title = document.title
-                    hrefs = [
-                        reference.url
-                        for reference in document.references
-                        if reference.source_tag == "a"
-                    ]
-                    discover_links(hrefs, item.url, item.crawl_depth, allowed_hosts)
+                    store_document(result, document)
+                    discover_references(
+                        document.references,
+                        item.url,
+                        item.crawl_depth,
+                        allowed_hosts,
+                    )
 
         if not completion_reason:
             completion_reason = "queue_exhausted"

@@ -654,6 +654,29 @@ class CrawlerAcceptanceTests(unittest.TestCase):
                 ),
                 "/interrupt-active": self.html("active"),
                 "/interrupt-queued": self.html("queued"),
+                "/resource-home": self.html(
+                    '<img src="/logo.webp">'
+                    '<img src="/logo.webp" srcset="/logo.webp 1x, /responsive.webp 2x">'
+                    '<script src="/app.js"></script>'
+                    '<link rel="stylesheet" href="/style.css">'
+                    '<link rel="preload" as="document" href="/document.pdf">'
+                    '<script src="http://cdn.example.invalid/external.js"></script>'
+                    '<img src="http://cdn.example.invalid/external.webp">'
+                    '<a href="http://example.invalid/external-page">external page</a>'
+                ),
+                "/logo.webp": (200, {"Content-Type": "image/webp"}, b"logo"),
+                "/responsive.webp": (
+                    200,
+                    {"Content-Type": "image/webp"},
+                    b"responsive",
+                ),
+                "/app.js": (
+                    200,
+                    {"Content-Type": "application/javascript"},
+                    '<a href="/fake-link-inside-js">not HTML</a>',
+                ),
+                "/style.css": (200, {"Content-Type": "text/css"}, b"body{}"),
+                "/document.pdf": (200, {"Content-Type": "application/pdf"}, b"PDF"),
             }
         )
 
@@ -761,6 +784,42 @@ class CrawlerAcceptanceTests(unittest.TestCase):
         self.assertEqual(summary.completion_reason, "interrupted")
         self.assertEqual(rows[self.url("/interrupt-active")]["error"], "interrupted")
         self.assertEqual(rows[self.url("/interrupt-queued")]["error"], "interrupted")
+
+    def test_embedded_resources_are_inventoried_without_non_html_recursion(self):
+        self.run_crawl("/resource-home")
+        rows = self.read_rows()
+
+        logo = rows[self.url("/logo.webp")]
+        self.assertEqual(logo["resource_type"], "image")
+        self.assertEqual(logo["discovery_count"], "3")
+        self.assertEqual(logo["source_url"], self.url("/resource-home"))
+        self.assertEqual(logo["source_tag"], "img")
+        self.assertEqual(logo["source_attribute"], "src")
+        self.assertEqual(self.server.hits["/logo.webp"], 1)
+        self.assertEqual(self.server.hits["/responsive.webp"], 1)
+        self.assertEqual(self.server.hits["/app.js"], 1)
+        self.assertEqual(self.server.hits["/style.css"], 1)
+        self.assertEqual(self.server.hits["/document.pdf"], 1)
+        self.assertNotIn(self.url("/fake-link-inside-js"), rows)
+
+        stylesheet = rows[self.url("/style.css")]
+        self.assertEqual(stylesheet["source_tag"], "link")
+        self.assertEqual(stylesheet["source_attribute"], "href")
+        self.assertEqual(stylesheet["link_rel"], "stylesheet")
+        self.assertEqual(stylesheet["resource_type"], "css")
+
+        external_script = rows["http://cdn.example.invalid/external.js"]
+        self.assertEqual(external_script["discovery_count"], "1")
+        self.assertEqual(external_script["indexable"], "N/A")
+        self.assertEqual(
+            external_script["indexability_reason"],
+            "External resource not evaluated",
+        )
+        self.assertEqual(
+            external_script["error"], "external_resource_not_requested"
+        )
+        self.assertIn("http://cdn.example.invalid/external.webp", rows)
+        self.assertNotIn("http://example.invalid/external-page", rows)
 
 
 class CliTests(unittest.TestCase):
