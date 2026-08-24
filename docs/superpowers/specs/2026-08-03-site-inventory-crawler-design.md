@@ -2,9 +2,13 @@
 
 日期：2026-08-03
 
+2026-08-24 资源清单与可索引性升级的详细决策见
+[`2026-08-24-indexability-resource-inventory-design.md`](2026-08-24-indexability-resource-inventory-design.md)。
+本文已同步最终实现基线。
+
 ## 1. 目标
 
-实现一个最小可行的单站点爬虫，从用户提供的首页开始，通过静态 HTML 中的 `<a href>` 发现站内 URL，生成网站资产清单 CSV。
+实现一个最小可行的单站点爬虫，从用户提供的首页开始，通过静态 HTML 发现站内页面和嵌入资源，生成网站资产与可索引性清单 CSV，供开发者在部署前排查常见技术问题。
 
 程序不是通用爬虫框架。第一版不包含多线程、分布式抓取、登录、浏览器自动化、复杂断点恢复、数据库或图形界面。
 
@@ -16,6 +20,8 @@
 - 单个页面请求失败不会终止整个爬取。
 - 遵守 robots.txt 的 `Allow` 和 `Disallow`。
 - 所有已发现 URL 均可导出 CSV，包括被 robots 禁止或因限制未请求的 URL。
+- 资源只请求一次，只有成功 HTML 继续递归；外部嵌入资源只记录不访问。
+- HTML、PDF 和图片输出可解释的 `YES`/`NO`，其他资源输出 `N/A`。
 - 结束时明确说明自然完成或限制终止原因。
 
 ## 3. 技术选型与文件结构
@@ -36,7 +42,9 @@ tests/
 - `is_allowed_host()`：判断允许主机。
 - `load_robots()`：获取、解析并缓存 robots.txt。
 - `request_once()`：执行限速、超时且禁止自动跳转的单次请求。
-- `extract_links()`：从符合条件的 HTML 中提取链接和标题。
+- `extract_html()`：从符合条件的 HTML 中提取标题、SEO 元数据和带来源类型的引用。
+- `classify_resource()`：优先按 Content-Type 对资源分类。
+- `audit_canonical()`、`apply_indexability()`：生成可解释的可索引性结论。
 - `crawl()`：执行 BFS、去重和限制控制。
 - `write_csv()`：导出 CSV。
 - `main()`：处理命令行参数并输出结束摘要。
@@ -89,9 +97,13 @@ TLS 证书验证保持 Requests 默认开启。HTTP 请求不使用 TLS，因此
 
 URL 在加入队列或结果集时立即加入 `seen`，而不是等到发出请求时再加入，从而保证每个规范化 URL 最多请求一次。`source_url` 只保留首次发现来源。
 
+每次再次发现同一规范化 URL 时只增加 `discovery_count`，不覆盖首次的
+`source_url`、`source_tag`、`source_attribute` 和 `link_rel`，也不重复入队。
+外部 `<a>` 忽略；外部图片、脚本等嵌入资源建立不可请求的清单行。
+
 ## 7. URL 规范化
 
-对每个 `<a href>`：
+对每个已支持 HTML 引用：
 
 - 去除首尾空白。
 - 使用当前页面 URL 转换相对地址。
@@ -104,9 +116,13 @@ URL 在加入队列或结果集时立即加入 `seen`，而不是等到发出请
 - 保留路径大小写和尾部 `/` 的区别。
 - 保留普通查询参数。
 - 删除参数名以 `utm_` 开头的参数，以及 `gclid`、`fbclid`、`msclkid`。
-- 对剩余查询参数排序后用于去重。
+- 对剩余查询参数按参数名稳定排序；同名参数的多个值保持原始相对顺序且不去重。
 
-第一版不处理 `<base href>`、canonical 标签、表单提交或 JavaScript 生成的 URL。
+发现来源包括 `<a href>`、`<img src/srcset>`、`<source src/srcset>`、
+`<script src>`，以及 rel 为 stylesheet/icon/apple-touch-icon/mask-icon/
+manifest/preload/modulepreload 的 `<link href>`。`srcset` 拆分为独立 URL。
+`<link rel="canonical">` 作为 SEO 元数据，不加入普通资源清单。程序不处理
+`<base href>`、表单提交或 JavaScript 生成的 URL。
 
 ## 8. 请求与响应处理
 
@@ -114,8 +130,8 @@ URL 在加入队列或结果集时立即加入 `seen`，而不是等到发出请
 
 每个 URL 按以下规则处理：
 
-- `2xx` 且 MIME 类型为 HTML：读取并解析标题和 `<a href>`。
-- `2xx` 非 HTML：记录状态和类型，不下载或解析完整正文。
+- `2xx` 且 MIME 类型为 HTML：读取标题、generic meta robots、canonical 和受支持引用，并继续发现下一层。
+- `2xx` 非 HTML：记录状态和类型，不解析正文，也不继续发现 URL。
 - `3xx`：不解析正文，只处理 `Location`。
 - `3xx` 内部目标：记录重定向，并将目标以相同深度加入队列。
 - `3xx` 外部目标：记录目标和 `external_redirect`，不访问。
@@ -123,6 +139,11 @@ URL 在加入队列或结果集时立即加入 `seen`，而不是等到发出请
 - 请求异常：记录简短错误，继续处理队列。
 
 HTML 正文最多读取 5 MiB。超过限制时记录 `html_too_large`，不解析后续内容。只有 `2xx HTML` 可以继续发现链接。
+
+资源分类优先使用响应 Content-Type，缺失时再使用发现标签、`rel`、`as` 和
+URL 扩展名，输出 `html`、`pdf`、`image`、`css`、`javascript`、`font`、
+`json`、`media`、`other` 或 `unknown`。所有内部资源使用 GET 且最多请求一次；
+非 HTML 类型始终是终止行。
 
 ## 9. robots.txt
 
@@ -157,9 +178,21 @@ url
 status_code
 final_url
 title
+canonical_url
+canonical_self_reference
+canonical_warning
+meta_robots
+x_robots_tag
 source_url
+source_tag
+source_attribute
+link_rel
+discovery_count
 crawl_depth
 content_type
+resource_type
+indexable
+indexability_reason
 error
 ```
 
@@ -171,7 +204,23 @@ error
 - 重定向响应的 `final_url` 为解析后的 `Location`。
 - 请求失败或未请求时，`status_code` 为空。
 - 非 HTML 响应记录 `content_type`，但不解析。
+- `source_*` 和 `link_rel` 只保留首次发现值，`discovery_count` 统计全部引用次数。
+- `error` 只表示爬取或运行问题；SEO 结论写入 `indexable` 和 `indexability_reason`。
 - `error` 使用简短稳定标识，例如 `timeout`、`connection_error`、`tls_error`、`invalid_redirect`、`external_redirect`、`robots_disallowed`、`robots_unreachable`、`crawl_stopped_robots_unreachable`、`max_depth_exceeded`、`max_pages_reached` 和 `html_too_large`。
+
+可索引性基线：
+
+- HTML：状态严格等于 200、generic meta robots/X-Robots-Tag 均无完整
+  `noindex` 指令，且 canonical 缺失或规范化后指向 `final_url`，则为 `YES`。
+- PDF：状态 200 且 generic X-Robots-Tag 无 `noindex`，不要求 canonical。
+- 图片：状态 200、robots.txt 允许且 generic X-Robots-Tag 无 `noindex`，不要求 canonical。
+- CSS、JavaScript、font、JSON、media、other、unknown 为 `N/A`；外部嵌入资源为 `N/A`。
+
+HTML canonical 缺失仍为 `YES`，原因是 `Canonical missing`。canonical 比较以
+`final_url` 为准；等价比较移除 tracking 参数和 fragment，但展示值保留 tracking
+参数并移除 fragment，相应问题写入 `canonical_warning`。多个相同 canonical 产生
+warning；冲突、无效或指向其他 URL 的 canonical 是 blocker。本工具只做上述技术
+信号检查，不保证搜索引擎实际抓取或收录。
 
 ## 12. 终止行为与摘要
 
@@ -213,6 +262,9 @@ csv_path
 - 内部重定向目标入队且深度不增加。
 - robots `Allow` / `Disallow`、404 和临时失败行为。
 - 非 HTML 资源记录但不解析。
+- 图片/srcset、脚本、样式、字体、PDF 与外部嵌入资源发现和首次来源/重复次数。
+- Content-Type 优先的资源分类和非 HTML 终止递归。
+- HTML/PDF/图片的 indexability 矩阵、generic noindex、canonical 自引用和 warning。
 - 404、500 或连接失败不终止队列。
 - 最大深度和最大页面数的记录行为。
 - CSV 字段、首次来源和 BFS 深度。
@@ -226,5 +278,5 @@ csv_path
 - 登录、Cookie 持久化或浏览器自动化。
 - sitemap.xml 自动发现。
 - JavaScript 渲染或动态链接发现。
-- 表单提交、canonical 合并、`<base href>` 支持。
+- 表单提交或 `<base href>` 支持。
 - 数据库、断点恢复、可视化界面或通用插件系统。
