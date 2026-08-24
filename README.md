@@ -99,6 +99,161 @@ problems appear in `canonical_warning`, including `Tracking parameters present`,
 different URL, an invalid canonical, or conflicting canonical tags makes HTML
 `NO`.
 
+## Finding and filtering CSV data in PowerShell
+
+PowerShell reads the CSV header as property names. Import the crawl result once
+from the repository directory and reuse it for the following examples:
+
+```powershell
+$rows = Import-Csv .\inventory.csv
+```
+
+Replace `inventory.csv` with the path passed to `--output` if a different name
+was used.
+
+### Inspect the available fields
+
+Show every field and value from the first row:
+
+```powershell
+$rows | Select-Object -First 1 | Format-List *
+```
+
+Show selected fields as a table:
+
+```powershell
+$rows |
+    Select-Object url, status_code, resource_type, indexable, indexability_reason |
+    Format-Table -AutoSize
+```
+
+### Extract one column
+
+Display only the URL values:
+
+```powershell
+$rows | Select-Object -ExpandProperty url
+```
+
+Save one URL per line to `urls.txt`:
+
+```powershell
+$rows |
+    Select-Object -ExpandProperty url |
+    Set-Content .\urls.txt -Encoding UTF8
+```
+
+To keep a one-column CSV with its `url` header instead, use:
+
+```powershell
+$rows |
+    Select-Object url |
+    Export-Csv .\urls.csv -NoTypeInformation -Encoding UTF8
+```
+
+### Find particular URLs
+
+Find an exact normalized URL:
+
+```powershell
+$rows | Where-Object { $_.url -eq "https://example.com/products/" }
+```
+
+Find URLs containing a word or path segment. PowerShell's `-like` comparison is
+case-insensitive by default:
+
+```powershell
+$rows |
+    Where-Object { $_.url -like "*/products/*" } |
+    Select-Object url, status_code, indexable, indexability_reason
+```
+
+Use `-match` for a regular-expression search, for example PDF or image URLs:
+
+```powershell
+$rows |
+    Where-Object { $_.url -match "\.(pdf|png|jpe?g|webp)(\?|$)" } |
+    Select-Object url, resource_type, status_code, indexable
+```
+
+### Filter indexability results
+
+Show every row that the crawler evaluated as non-indexable:
+
+```powershell
+$rows |
+    Where-Object { $_.indexable -eq "NO" } |
+    Select-Object url, status_code, resource_type, indexability_reason, error |
+    Format-Table -AutoSize
+```
+
+Save those complete rows to another CSV for review in Excel:
+
+```powershell
+$rows |
+    Where-Object { $_.indexable -eq "NO" } |
+    Export-Csv .\non_indexable.csv -NoTypeInformation -Encoding UTF8
+```
+
+Find HTML pages that are indexable but have a missing canonical warning:
+
+```powershell
+$rows |
+    Where-Object {
+        $_.resource_type -eq "html" -and
+        $_.indexable -eq "YES" -and
+        $_.indexability_reason -eq "Canonical missing"
+    } |
+    Select-Object url, final_url, indexability_reason
+```
+
+Find rows with any canonical warning:
+
+```powershell
+$rows |
+    Where-Object { $_.canonical_warning -ne "" } |
+    Select-Object url, canonical_url, canonical_warning
+```
+
+Find request or crawl errors independently from SEO conclusions:
+
+```powershell
+$rows |
+    Where-Object { $_.error -ne "" } |
+    Select-Object url, status_code, resource_type, error
+```
+
+### Count and summarize results
+
+Count all discovered rows and all non-indexable rows:
+
+```powershell
+$rows.Count
+($rows | Where-Object { $_.indexable -eq "NO" }).Count
+```
+
+Summarize results by indexability value:
+
+```powershell
+$rows |
+    Group-Object indexable |
+    Sort-Object Name |
+    Select-Object Name, Count
+```
+
+Summarize the most common reasons for `NO`:
+
+```powershell
+$rows |
+    Where-Object { $_.indexable -eq "NO" } |
+    Group-Object indexability_reason |
+    Sort-Object Count -Descending |
+    Select-Object Count, Name
+```
+
+The generated `.csv` files and `urls.txt` are covered by this repository's
+`.gitignore`, so these local analysis results are not included in Git commits.
+
 ## Crawl behavior
 
 - Requests are single-threaded, rate-limited, and use a 10 second connection and
