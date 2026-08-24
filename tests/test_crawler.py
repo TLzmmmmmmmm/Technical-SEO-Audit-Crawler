@@ -343,6 +343,28 @@ class ResourceAuditTests(unittest.TestCase):
             "YES",
         )
 
+        for canonical in [
+            "http://example.com/final/",
+            "https://www.example.com/final/",
+            "https://example.com/final",
+        ]:
+            with self.subTest(canonical=canonical):
+                self.assertEqual(
+                    audit_canonical(
+                        [canonical], "https://example.com/final/"
+                    ).self_reference,
+                    "NO",
+                )
+
+    def test_invalid_canonical_is_a_blocker_instead_of_an_exception(self):
+        audit = audit_canonical(
+            ["http://[invalid", "https://example.com/page"],
+            "https://example.com/page",
+        )
+
+        self.assertEqual(audit.self_reference, "NO")
+        self.assertEqual(audit.blocker, "Invalid canonical URL")
+
     def test_applies_indexability_and_combines_blockers_in_fixed_order(self):
         result = CrawlResult(
             url="https://example.com/page",

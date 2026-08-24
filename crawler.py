@@ -346,8 +346,11 @@ def _canonical_normalization(
     candidate = value.strip()
     if not candidate:
         return None
-    resolved = urljoin(final_url, candidate)
-    parts = urlsplit(resolved)
+    try:
+        resolved = urljoin(final_url, candidate)
+        parts = urlsplit(resolved)
+    except ValueError:
+        return None
     scheme = parts.scheme.lower()
     if scheme not in ALLOWED_SCHEMES or not parts.hostname:
         return None
