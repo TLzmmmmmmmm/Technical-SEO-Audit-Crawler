@@ -1,14 +1,15 @@
 # Technical SEO Audit Crawler
 
-A lightweight technical SEO crawler that follows internal HTML pages
-breadth-first, audits referenced resources, and generates separate Page Audit
-and Resource Audit reports.
+A technical SEO crawler that follows internal HTML pages breadth-first, audits
+referenced resources, and generates separate Page Audit and Resource Audit
+reports.
 
-> **Page count refers only to HTML documents. Images, CSS, JavaScript, PDFs,
-> and other assets are reported separately as resources.**
+> **Page count refers to URLs classified as HTML page records, including page
+> discoveries that could not be requested or confirmed. URLs classified as
+> images, CSS, JavaScript, PDFs, and other resources are reported separately.**
 
 This is a pre-deployment technical check. `indexable=YES` means the response
-passes this tool's approved status, robots directive, and canonical rules; it
+passes the status, robots-directive, and canonical rules documented below; it
 does not guarantee inclusion in Google, Bing, or another search engine.
 
 ## Features
@@ -24,6 +25,9 @@ does not guarantee inclusion in Google, Bing, or another search engine.
 
 ## Example Output
 
+The numbers below are example values, but the labels and layout match the
+terminal summary:
+
 ```text
 Crawl completed: https://example.com/
 Completion reason: queue_exhausted
@@ -38,7 +42,12 @@ Resources
   Images ............. 27
   CSS ................ 3
   JavaScript ......... 6
-  Other resources .... 4
+  PDF ................ 1
+  Font ............... 1
+  Video .............. 0
+  Audio .............. 0
+  Other .............. 2
+  Errors ............. 0
 
 Output
   audit\pages.csv
@@ -47,9 +56,9 @@ Output
 Total unique URLs discovered: 82
 ```
 
-`pages.csv` records HTML crawl results and indexability decisions.
-`resources.csv` identifies referenced assets and failures. Page totals refer
-only to HTML documents.
+`pages.csv` records URLs classified as HTML pages, their crawl results, and
+their indexability decisions. `resources.csv` records URLs classified as
+non-HTML resources and their crawl results.
 
 ## Architecture
 
@@ -61,7 +70,8 @@ Start URL
   -> normalize URL and establish allowed host
   -> check robots.txt and crawl limits
   -> request without automatic redirects
-  -> classify by Content-Type
+  -> classify from Content-Type when present; otherwise use discovery context
+     and URL extension
      -> HTML: audit SEO metadata, discover links/resources, continue BFS
      -> non-HTML: audit and record the resource, do not recurse
   -> finalize indexability
@@ -90,10 +100,12 @@ Run an audit:
 .\.venv\Scripts\python.exe crawler.py https://example.com/ --output-dir .\audit
 ```
 
-Common options are `--delay`, `--timeout`, `--max-pages`, and `--max-depth`.
-Defaults are a 0.5 second request interval, 10 second timeout, 3,000 page
-requests, and depth 10. `--output-dir` defaults to the current directory. Every
-crawl writes:
+Available options are `--delay`, `--timeout`, `--max-pages`, and `--max-depth`.
+Defaults are a 0.5 second request interval, 10 second timeout, 3,000 requested
+content URLs, and depth 10. The `--max-pages` counter includes the requested
+start-page redirect chain and queued internal pages and resources; `robots.txt`
+requests are not included. `--output-dir` defaults to the current directory.
+During finalization, the crawler writes:
 
 ```text
 audit\pages.csv
@@ -104,15 +116,14 @@ The terminal summary reports discovered/indexable HTML pages first, then
 resource counts by type. `Total unique URLs discovered` is shown separately and
 means pages plus resources; it is not a page count.
 
-CSV and TXT files are ignored by Git except for `requirements.txt`, so normal
-crawl outputs such as `pages.csv`, `resources.csv`, and `urls.txt` are not
-uploaded.
+The repository's `.gitignore` ignores `*.csv` and `*.txt`, with an exception for
+`requirements.txt`.
 
 ## Reports
 
 Both UTF-8-with-BOM reports preserve first-discovery order. `pages.csv` contains
-HTML records only, including redirects, 4xx/5xx pages, robots-blocked pages, and
-failed or limited HTML discoveries:
+records classified as HTML pages, including redirects, 4xx/5xx responses,
+robots-blocked discoveries, and failed or limited page discoveries:
 
 ### Page Audit: `pages.csv`
 
@@ -122,7 +133,8 @@ url,status_code,final_url,title,canonical_url,canonical_self_reference,canonical
 
 ### Resource Audit: `resources.csv`
 
-`resources.csv` contains all non-HTML discoveries without HTML-only SEO fields:
+`resources.csv` contains all records not classified as HTML, without HTML-only
+SEO fields:
 
 ```text
 url,status_code,final_url,resource_type,content_type,source_url,source_tag,source_attribute,link_rel,discovery_count,crawl_depth,indexable,indexability_reason,error
@@ -131,8 +143,8 @@ url,status_code,final_url,resource_type,content_type,source_url,source_tag,sourc
 First-discovery source metadata is retained. `discovery_count` starts at 1 and
 increments for every later occurrence; it is not a unique-referring-page count.
 `resource_type` is selected from `pdf`, `image`, `css`, `javascript`, `font`,
-`json`, `audio`, `video`, `other`, and `unknown`, preferring response
-Content-Type over discovery hints and extensions.
+`json`, `audio`, `video`, `other`, and `unknown`. Classification uses response
+Content-Type when present and otherwise uses discovery hints and extensions.
 
 `error` is reserved for crawl/runtime conditions such as `timeout`,
 `robots_disallowed`, or `external_resource_not_requested`. SEO conclusions are
@@ -156,20 +168,22 @@ robots directive handling, blocker precedence, and edge-case behavior.
 ## Crawl Behavior
 
 - Successful HTML responses discover page links from `<a href>`, images from
-  `<img src/srcset>` and `<source src/srcset>`, scripts from `<script src>`, and
-  selected `<link href>` resources: stylesheet, icon, apple-touch-icon,
-  mask-icon, manifest, preload, and modulepreload.
-- Every `srcset` candidate becomes an independent URL. Canonical links are SEO
-  metadata, not resource rows. External page links are ignored; external
-  embedded resources receive a row but are never requested.
-- Requests are single-threaded, rate-limited, and use a 10 second connection and
-  read timeout by default. TLS verification keeps Requests defaults.
+  `<img src/srcset>`, media resources from `<source src/srcset>`, scripts from
+  `<script src>`, and selected `<link href>` resources: stylesheet, icon,
+  apple-touch-icon, mask-icon, manifest, preload, and modulepreload.
+- Comma-separated `srcset` entries are extracted as individual resource URLs.
+  Canonical links are SEO metadata, not resource rows. External page links are
+  ignored; external embedded resources receive a row but are never requested.
+- Requests are single-threaded and use the configured delay, which defaults to
+  0.5 seconds. Connection and read timeouts both default to 10 seconds. TLS
+  verification keeps Requests defaults.
 - Automatic redirects are disabled. Internal targets are queued at the same
   depth; external targets are recorded but never requested. The initial home
   page redirect chain is the bootstrap exception used to establish scope.
-- Scope is the final home-page hostname plus exactly its add/remove `www.`
-  alias. Other subdomains and domains are ignored. HTTP/HTTPS and bare/`www`
-  URLs remain distinct inventory entries.
+- Request scope is the final home-page hostname plus exactly its add/remove
+  `www.` alias. Page links to other hosts are ignored; supported embedded
+  resources on other hosts are recorded without being requested. HTTP/HTTPS
+  and bare/`www` URLs remain distinct inventory entries.
 - Query parameters are sorted by name while same-name values retain their
   relative order. `utm_*`, `gclid`, `fbclid`, and `msclkid` are removed, and
   fragments are discarded.
@@ -180,22 +194,22 @@ robots directive handling, blocker precedence, and edge-case behavior.
 
 ## Scope and Limitations
 
-The project intentionally stays small and predictable. It does not provide:
+The project intentionally excludes:
 
 - Concurrent or distributed crawling
 - JavaScript rendering or browser automation
-- Login, session, form, or authenticated crawling
+- Configured login, authentication, or form submission
 - Sitemap discovery or `<base href>` processing
 - Database storage or checkpoint recovery
-- A GUI or a general-purpose crawler framework
+- A GUI
 - A guarantee that a search engine will crawl or index a URL
 
 ## Testing
 
 The `unittest` suite uses local HTTP servers and does not contact a live
-website. It covers URL normalization, robots rules, redirects, BFS discovery,
-resource classification, indexability, reports, limits, failures, interrupt
-handling, and the command-line entry point.
+website. It covers URL normalization, URL discovery and deduplication, robots
+rules, redirects, resource classification, indexability, reports, limits,
+failures, interrupt handling, and the command-line entry point.
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
@@ -209,7 +223,8 @@ handling, and the command-line entry point.
 - Protego for `robots.txt` rules
 - Standard-library `csv`, `urllib.parse`, `argparse`, and `unittest`
 
-Tested primarily with Windows PowerShell.
+The setup, execution, and report-analysis commands in this README target
+Windows PowerShell.
 
 ## PowerShell Analysis Examples
 
