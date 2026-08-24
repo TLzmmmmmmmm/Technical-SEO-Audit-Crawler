@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import csv
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 import re
 import time
@@ -31,29 +31,6 @@ FOLLOW_INTERNAL_REDIRECTS = True
 FOLLOW_EXTERNAL_REDIRECTS = False
 RECORD_FIRST_SOURCE_ONLY = True
 PARSE_HTML_ONLY = True
-
-CSV_FIELDS = [
-    "url",
-    "status_code",
-    "final_url",
-    "title",
-    "canonical_url",
-    "canonical_self_reference",
-    "canonical_warning",
-    "meta_robots",
-    "x_robots_tag",
-    "source_url",
-    "source_tag",
-    "source_attribute",
-    "link_rel",
-    "discovery_count",
-    "crawl_depth",
-    "content_type",
-    "resource_type",
-    "indexable",
-    "indexability_reason",
-    "error",
-]
 
 PAGE_CSV_FIELDS = [
     "url",
@@ -210,8 +187,15 @@ class AuditMetrics:
 
 @dataclass
 class CrawlSummary:
+    start_url: str
     completion_reason: str
-    discovered_urls: int
+    pages_discovered: int
+    indexable_pages: int
+    non_indexable_pages: int
+    page_errors: int
+    resource_counts: dict[str, int]
+    resource_errors: int
+    total_unique_urls: int
     requested_urls: int
     successful_responses: int
     redirects: int
@@ -219,7 +203,8 @@ class CrawlSummary:
     robots_disallowed: int
     depth_limited: int
     page_limited: int
-    csv_path: str
+    pages_path: str
+    resources_path: str
 
 
 class RobotsUnavailableError(RuntimeError):
@@ -776,17 +761,6 @@ def _request_error(exc: requests.RequestException) -> str:
     return "request_error"
 
 
-def write_csv(results: dict[str, CrawlResult], output_path: str | Path) -> None:
-    """Write crawl results in first-discovery order using UTF-8 with BOM."""
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        for result in results.values():
-            writer.writerow({field: getattr(result, field) for field in CSV_FIELDS})
-
-
 def report_paths(output_dir: str | Path) -> ReportPaths:
     """Return the fixed public report paths beneath an output directory."""
     directory = Path(output_dir)
@@ -859,14 +833,23 @@ def _audit_metrics(results: dict[str, CrawlResult]) -> AuditMetrics:
 
 def _summary(
     results: dict[str, CrawlResult],
+    start_url: str,
     completion_reason: str,
     requested_urls: int,
-    output_path: str | Path,
+    paths: ReportPaths,
 ) -> CrawlSummary:
     values = list(results.values())
+    metrics = _audit_metrics(results)
     return CrawlSummary(
+        start_url=start_url,
         completion_reason=completion_reason,
-        discovered_urls=len(values),
+        pages_discovered=metrics.pages_discovered,
+        indexable_pages=metrics.indexable_pages,
+        non_indexable_pages=metrics.non_indexable_pages,
+        page_errors=metrics.page_errors,
+        resource_counts=metrics.resource_counts,
+        resource_errors=metrics.resource_errors,
+        total_unique_urls=metrics.total_unique_urls,
         requested_urls=requested_urls,
         successful_responses=sum(
             result.status_code is not None and 200 <= result.status_code < 300
@@ -883,13 +866,48 @@ def _summary(
         robots_disallowed=sum(result.error == "robots_disallowed" for result in values),
         depth_limited=sum(result.error == "max_depth_exceeded" for result in values),
         page_limited=sum(result.error == "max_pages_reached" for result in values),
-        csv_path=str(output_path),
+        pages_path=str(paths.pages),
+        resources_path=str(paths.resources),
+    )
+
+
+def format_summary(summary: CrawlSummary) -> str:
+    """Format user-facing page and resource audit metrics."""
+    counts = summary.resource_counts
+    return "\n".join(
+        [
+            f"Crawl completed: {summary.start_url}",
+            f"Completion reason: {summary.completion_reason}",
+            "",
+            "Pages",
+            f"  Discovered ........ {summary.pages_discovered}",
+            f"  Indexable .......... {summary.indexable_pages}",
+            f"  Non-indexable ...... {summary.non_indexable_pages}",
+            f"  Errors ............. {summary.page_errors}",
+            "",
+            "Resources",
+            f"  Images ............. {counts['image']}",
+            f"  CSS ................ {counts['css']}",
+            f"  JavaScript ......... {counts['javascript']}",
+            f"  PDF ................ {counts['pdf']}",
+            f"  Font ............... {counts['font']}",
+            f"  Video .............. {counts['video']}",
+            f"  Audio .............. {counts['audio']}",
+            f"  Other .............. {counts['other']}",
+            f"  Errors ............. {summary.resource_errors}",
+            "",
+            "Output",
+            f"  {summary.pages_path}",
+            f"  {summary.resources_path}",
+            "",
+            f"Total unique URLs discovered: {summary.total_unique_urls}",
+        ]
     )
 
 
 def crawl(
     start_url: str,
-    output_path: str | Path,
+    output_dir: str | Path,
     *,
     delay: float = REQUEST_DELAY,
     timeout: float = REQUEST_TIMEOUT,
@@ -899,6 +917,7 @@ def crawl(
 ) -> CrawlSummary:
     """Crawl one site breadth-first and export every discovered URL."""
     normalized_start = normalize_url(start_url)
+    paths = report_paths(output_dir)
     results: dict[str, CrawlResult] = {}
     queue: deque[CrawlItem] = deque()
     seen: set[str] = set()
@@ -1011,10 +1030,16 @@ def crawl(
                 results[item.url].error = error
 
     if normalized_start is None:
-        write_csv(results, output_path)
+        write_reports(results, output_dir)
         if own_session:
             active_session.close()
-        return _summary(results, "start_url_failed", requested_urls, output_path)
+        return _summary(
+            results,
+            start_url,
+            "start_url_failed",
+            requested_urls,
+            paths,
+        )
 
     discover(normalized_start, "", 0, resource_hint="html", enqueue=False)
     current = CrawlItem(normalized_start, "", 0)
@@ -1191,11 +1216,17 @@ def crawl(
         completion_reason = "interrupted"
     finally:
         finalize_results()
-        write_csv(results, output_path)
+        write_reports(results, output_dir)
         if own_session:
             active_session.close()
 
-    return _summary(results, completion_reason, requested_urls, output_path)
+    return _summary(
+        results,
+        normalized_start,
+        completion_reason,
+        requested_urls,
+        paths,
+    )
 
 
 def _http_url(value: str) -> str:
@@ -1234,9 +1265,16 @@ def _non_negative_int(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Create a CSV inventory of one website.")
+    parser = argparse.ArgumentParser(
+        description="Audit HTML pages and referenced resources separately.",
+        allow_abbrev=False,
+    )
     parser.add_argument("start_url", type=_http_url, help="HTTP(S) home page to crawl")
-    parser.add_argument("--output", default="inventory.csv", help="output CSV path")
+    parser.add_argument(
+        "--output-dir",
+        default=".",
+        help="directory for pages.csv and resources.csv",
+    )
     parser.add_argument("--delay", type=_non_negative_float, default=REQUEST_DELAY)
     parser.add_argument("--timeout", type=_positive_float, default=REQUEST_TIMEOUT)
     parser.add_argument("--max-pages", type=_positive_int, default=MAX_PAGES)
@@ -1248,14 +1286,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     summary = crawl(
         args.start_url,
-        args.output,
+        args.output_dir,
         delay=args.delay,
         timeout=args.timeout,
         max_pages=args.max_pages,
         max_depth=args.max_depth,
     )
-    for field in fields(CrawlSummary):
-        print(f"{field.name}={getattr(summary, field.name)}")
+    print(format_summary(summary))
 
     if summary.completion_reason == "interrupted":
         return 130

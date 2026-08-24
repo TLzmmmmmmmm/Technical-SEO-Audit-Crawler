@@ -16,7 +16,6 @@ import requests
 import crawler as crawler_module
 
 from crawler import (
-    CSV_FIELDS,
     CanonicalAudit,
     CrawlResult,
     DiscoveredReference,
@@ -40,29 +39,6 @@ from crawler import (
     robots_allowed,
 )
 
-
-EXPECTED_CSV_FIELDS = [
-    "url",
-    "status_code",
-    "final_url",
-    "title",
-    "canonical_url",
-    "canonical_self_reference",
-    "canonical_warning",
-    "meta_robots",
-    "x_robots_tag",
-    "source_url",
-    "source_tag",
-    "source_attribute",
-    "link_rel",
-    "discovery_count",
-    "crawl_depth",
-    "content_type",
-    "resource_type",
-    "indexable",
-    "indexability_reason",
-    "error",
-]
 
 EXPECTED_PAGE_CSV_FIELDS = [
     "url",
@@ -156,9 +132,6 @@ class UrlNormalizationTests(unittest.TestCase):
             normalize_url("https://example.com/?tag=b&x=1&tag=a"),
             "https://example.com/?tag=b&tag=a&x=1",
         )
-
-    def test_csv_fields_match_indexability_schema(self):
-        self.assertEqual(CSV_FIELDS, EXPECTED_CSV_FIELDS)
 
     def test_rejects_unsupported_or_invalid_links(self):
         for href in (
@@ -378,6 +351,55 @@ class SummaryTests(unittest.TestCase):
         )
         self.assertEqual(metrics.resource_errors, 1)
         self.assertEqual(metrics.total_unique_urls, 10)
+
+    def test_formats_page_and_resource_hierarchy_with_total_urls_secondary(self):
+        summary = crawler_module.CrawlSummary(
+            start_url="https://example.com/",
+            completion_reason="queue_exhausted",
+            pages_discovered=2,
+            indexable_pages=1,
+            non_indexable_pages=1,
+            page_errors=0,
+            resource_counts={
+                "image": 1,
+                "css": 0,
+                "javascript": 0,
+                "pdf": 0,
+                "font": 0,
+                "video": 0,
+                "audio": 0,
+                "other": 0,
+            },
+            resource_errors=0,
+            total_unique_urls=3,
+            requested_urls=3,
+            successful_responses=2,
+            redirects=1,
+            request_failures=0,
+            robots_disallowed=0,
+            depth_limited=0,
+            page_limited=0,
+            pages_path="audit\\pages.csv",
+            resources_path="audit\\resources.csv",
+        )
+
+        output = crawler_module.format_summary(summary)
+
+        expected_fragments = [
+            "Pages",
+            "Discovered ........ 2",
+            "Indexable .......... 1",
+            "Non-indexable ...... 1",
+            "Resources",
+            "Images ............. 1",
+            "Output",
+            "audit\\pages.csv",
+            "audit\\resources.csv",
+            "Total unique URLs discovered: 3",
+        ]
+        positions = [output.index(fragment) for fragment in expected_fragments]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("Total URLs:", output)
 
 
 class ResourceAuditTests(unittest.TestCase):
@@ -713,7 +735,9 @@ class CrawlerAcceptanceTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
-        self.output_csv = f"{self.temp_dir.name}\\inventory.csv"
+        self.output_dir = Path(self.temp_dir.name)
+        self.pages_csv = self.output_dir / "pages.csv"
+        self.resources_csv = self.output_dir / "resources.csv"
 
         self.server = self.start_server()
         self.addCleanup(self.stop_server, self.server)
@@ -763,12 +787,18 @@ class CrawlerAcceptanceTests(unittest.TestCase):
                     '<a href="/missing">Missing</a>'
                     '<a href="/private">Private</a>'
                     '<a href="http://example.invalid/out">External</a>'
+                    '<img src="/missing-image.webp">'
                 ),
                 "/about": self.html("<title>About</title>"),
                 "/redirect": (302, {"Location": "/redirect-target"}, b""),
                 "/redirect-target": self.html("<title>Target</title>"),
                 "/asset.pdf": (200, {"Content-Type": "application/pdf"}, b"PDF"),
                 "/missing": (404, {"Content-Type": "text/html"}, '<a href="/hidden">x</a>'),
+                "/missing-image.webp": (
+                    404,
+                    {"Content-Type": "image/webp"},
+                    b"missing image",
+                ),
                 "/private": self.html("private"),
                 "/redirect-home": (302, {"Location": "/redirect-target"}, b""),
                 "/external-redirect-home": (
@@ -843,14 +873,19 @@ class CrawlerAcceptanceTests(unittest.TestCase):
             }
         )
 
+    @staticmethod
+    def read_report(path):
+        with Path(path).open(encoding="utf-8-sig", newline="") as handle:
+            return list(csv.DictReader(handle))
+
     def read_rows(self):
-        with open(self.output_csv, encoding="utf-8-sig", newline="") as handle:
-            return {row["url"]: row for row in csv.DictReader(handle)}
+        rows = self.read_report(self.pages_csv) + self.read_report(self.resources_csv)
+        return {row["url"]: row for row in rows}
 
     def run_crawl(self, path, **overrides):
         options = {"delay": 0, "timeout": 1, "max_pages": 100, "max_depth": 10}
         options.update(overrides)
-        return crawl(self.url(path), self.output_csv, **options)
+        return crawl(self.url(path), self.output_dir, **options)
 
     def test_bfs_records_assets_once_and_obeys_robots(self):
         summary = self.run_crawl("/")
@@ -863,9 +898,22 @@ class CrawlerAcceptanceTests(unittest.TestCase):
         self.assertEqual(rows[self.url("/asset.pdf")]["content_type"], "application/pdf")
         self.assertEqual(rows[self.url("/redirect")]["status_code"], "302")
         self.assertNotIn("http://example.invalid/out", rows)
-        with open(self.output_csv, encoding="utf-8-sig", newline="") as handle:
-            all_rows = list(csv.DictReader(handle))
-        self.assertEqual(list(all_rows[0]), EXPECTED_CSV_FIELDS)
+        page_rows = self.read_report(self.pages_csv)
+        resource_rows = self.read_report(self.resources_csv)
+        pages = {row["url"]: row for row in page_rows}
+        resources = {row["url"]: row for row in resource_rows}
+        self.assertIn(self.url("/about"), pages)
+        self.assertIn(self.url("/redirect"), pages)
+        self.assertIn(self.url("/missing"), pages)
+        self.assertIn(self.url("/asset.pdf"), resources)
+        self.assertIn(self.url("/missing-image.webp"), resources)
+        self.assertEqual(
+            resources[self.url("/missing-image.webp")]["status_code"], "404"
+        )
+        self.assertTrue(set(pages).isdisjoint(resources))
+        self.assertEqual(list(page_rows[0]), EXPECTED_PAGE_CSV_FIELDS)
+        self.assertEqual(list(resource_rows[0]), EXPECTED_RESOURCE_CSV_FIELDS)
+        all_rows = page_rows + resource_rows
         self.assertEqual(len(all_rows), len({row["url"] for row in all_rows}))
 
     def test_internal_redirect_target_keeps_depth(self):
@@ -989,7 +1037,9 @@ class IndexabilityAcceptanceTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
-        self.output_csv = f"{self.temp_dir.name}\\audit.csv"
+        self.output_dir = Path(self.temp_dir.name)
+        self.pages_csv = self.output_dir / "pages.csv"
+        self.resources_csv = self.output_dir / "resources.csv"
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _CrawlerTestHandler)
         self.server.hits = Counter()
         self.server.robots_status = 200
@@ -1086,13 +1136,16 @@ class IndexabilityAcceptanceTests(unittest.TestCase):
         }
 
     def read_rows(self):
-        with open(self.output_csv, encoding="utf-8-sig", newline="") as handle:
-            return {row["url"]: row for row in csv.DictReader(handle)}
+        rows = []
+        for path in (self.pages_csv, self.resources_csv):
+            with path.open(encoding="utf-8-sig", newline="") as handle:
+                rows.extend(csv.DictReader(handle))
+        return {row["url"]: row for row in rows}
 
     def test_exports_explainable_indexability_matrix(self):
         crawl(
             self.url("/audit-home"),
-            self.output_csv,
+            self.output_dir,
             delay=0,
             timeout=1,
             max_pages=100,
@@ -1168,13 +1221,22 @@ class CliTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
-        self.output_csv = f"{self.temp_dir.name}\\cli-inventory.csv"
+        self.output_dir = Path(self.temp_dir.name)
+        self.pages_csv = self.output_dir / "pages.csv"
+        self.resources_csv = self.output_dir / "resources.csv"
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _CrawlerTestHandler)
         self.server.hits = Counter()
         self.server.robots_status = 404
         self.server.robots_body = ""
         self.server.routes = {
-            "/": (200, {"Content-Type": "text/html"}, "<title>CLI</title>"),
+            "/": (
+                200,
+                {"Content-Type": "text/html"},
+                '<title>CLI</title><img src="/logo.webp">'
+                '<link rel="stylesheet" href="/style.css">',
+            ),
+            "/logo.webp": (200, {"Content-Type": "image/webp"}, b"logo"),
+            "/style.css": (200, {"Content-Type": "text/css"}, b"body{}"),
         }
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -1194,8 +1256,8 @@ class CliTests(unittest.TestCase):
             exit_code = main(
                 [
                     self.url(),
-                    "--output",
-                    self.output_csv,
+                    "--output-dir",
+                    str(self.output_dir),
                     "--delay",
                     "0",
                     "--timeout",
@@ -1208,8 +1270,26 @@ class CliTests(unittest.TestCase):
             )
 
         self.assertEqual(exit_code, 0)
-        self.assertIn("completion_reason=queue_exhausted", stdout.getvalue())
-        self.assertIn(f"csv_path={self.output_csv}", stdout.getvalue())
+        output = stdout.getvalue()
+        self.assertIn("Completion reason: queue_exhausted", output)
+        self.assertIn("Pages", output)
+        self.assertIn("Discovered ........ 1", output)
+        self.assertIn("Resources", output)
+        self.assertIn("Images ............. 1", output)
+        self.assertIn("CSS ................ 1", output)
+        self.assertIn("Output", output)
+        self.assertIn(str(self.pages_csv), output)
+        self.assertIn(str(self.resources_csv), output)
+        self.assertIn("Total unique URLs discovered: 3", output)
+        self.assertTrue(self.pages_csv.exists())
+        self.assertTrue(self.resources_csv.exists())
+
+    def test_old_output_option_is_rejected_without_request(self):
+        with self.assertRaises(SystemExit) as raised:
+            main([self.url(), "--output", "inventory.csv"])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(sum(self.server.hits.values()), 0)
 
     def test_invalid_scheme_is_an_argparse_error_without_request(self):
         with self.assertRaises(SystemExit) as raised:
