@@ -3,6 +3,7 @@ from contextlib import redirect_stdout
 import csv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
+from pathlib import Path
 import socket
 import tempfile
 import threading
@@ -11,6 +12,8 @@ from unittest import mock
 from urllib.parse import urlsplit
 
 import requests
+
+import crawler as crawler_module
 
 from crawler import (
     CSV_FIELDS,
@@ -56,6 +59,45 @@ EXPECTED_CSV_FIELDS = [
     "crawl_depth",
     "content_type",
     "resource_type",
+    "indexable",
+    "indexability_reason",
+    "error",
+]
+
+EXPECTED_PAGE_CSV_FIELDS = [
+    "url",
+    "status_code",
+    "final_url",
+    "title",
+    "canonical_url",
+    "canonical_self_reference",
+    "canonical_warning",
+    "meta_robots",
+    "x_robots_tag",
+    "source_url",
+    "source_tag",
+    "source_attribute",
+    "link_rel",
+    "discovery_count",
+    "crawl_depth",
+    "content_type",
+    "indexable",
+    "indexability_reason",
+    "error",
+]
+
+EXPECTED_RESOURCE_CSV_FIELDS = [
+    "url",
+    "status_code",
+    "final_url",
+    "resource_type",
+    "content_type",
+    "source_url",
+    "source_tag",
+    "source_attribute",
+    "link_rel",
+    "discovery_count",
+    "crawl_depth",
     "indexable",
     "indexability_reason",
     "error",
@@ -242,6 +284,58 @@ class HtmlExtractionTests(unittest.TestCase):
         )
 
 
+class ReportWriterTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    @staticmethod
+    def read_report(path):
+        with Path(path).open(encoding="utf-8-sig", newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    def test_writes_non_overlapping_page_and_resource_reports(self):
+        results = {
+            "/page": CrawlResult(
+                "/page", status_code=200, resource_type="html", title="Page"
+            ),
+            "/image": CrawlResult(
+                "/image", status_code=200, resource_type="image"
+            ),
+            "/missing": CrawlResult(
+                "/missing", status_code=404, resource_type="html"
+            ),
+        }
+
+        paths = crawler_module.write_reports(results, self.temp_dir.name)
+        page_rows = self.read_report(paths.pages)
+        resource_rows = self.read_report(paths.resources)
+
+        self.assertEqual(paths.pages.name, "pages.csv")
+        self.assertEqual(paths.resources.name, "resources.csv")
+        self.assertEqual([row["url"] for row in page_rows], ["/page", "/missing"])
+        self.assertEqual([row["url"] for row in resource_rows], ["/image"])
+        self.assertEqual(list(page_rows[0]), EXPECTED_PAGE_CSV_FIELDS)
+        self.assertEqual(list(resource_rows[0]), EXPECTED_RESOURCE_CSV_FIELDS)
+        self.assertTrue(
+            {row["url"] for row in page_rows}.isdisjoint(
+                row["url"] for row in resource_rows
+            )
+        )
+
+    def test_empty_results_still_write_both_headers(self):
+        paths = crawler_module.write_reports({}, self.temp_dir.name)
+
+        with paths.pages.open(encoding="utf-8-sig", newline="") as handle:
+            page_reader = csv.DictReader(handle)
+            self.assertEqual(page_reader.fieldnames, EXPECTED_PAGE_CSV_FIELDS)
+            self.assertEqual(list(page_reader), [])
+        with paths.resources.open(encoding="utf-8-sig", newline="") as handle:
+            resource_reader = csv.DictReader(handle)
+            self.assertEqual(resource_reader.fieldnames, EXPECTED_RESOURCE_CSV_FIELDS)
+            self.assertEqual(list(resource_reader), [])
+
+
 class ResourceAuditTests(unittest.TestCase):
     def test_classifies_response_mime_types_and_fallbacks(self):
         cases = [
@@ -253,10 +347,13 @@ class ResourceAuditTests(unittest.TestCase):
             (("application/javascript", "/x", None), "javascript"),
             (("font/woff2", "/x", None), "font"),
             (("application/ld+json", "/x", None), "json"),
-            (("video/mp4", "/x", None), "media"),
+            (("video/mp4", "/x", None), "video"),
+            (("audio/mpeg", "/x", None), "audio"),
             (("application/octet-stream", "/x", None), "other"),
             (("", "/document.pdf", None), "pdf"),
             (("", "/font.woff2", None), "font"),
+            (("", "/movie.mp4", None), "video"),
+            (("", "/sound.mp3", None), "audio"),
             (("", "/unknown", None), "unknown"),
             (
                 (

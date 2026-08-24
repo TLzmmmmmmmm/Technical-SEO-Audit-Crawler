@@ -55,6 +55,45 @@ CSV_FIELDS = [
     "error",
 ]
 
+PAGE_CSV_FIELDS = [
+    "url",
+    "status_code",
+    "final_url",
+    "title",
+    "canonical_url",
+    "canonical_self_reference",
+    "canonical_warning",
+    "meta_robots",
+    "x_robots_tag",
+    "source_url",
+    "source_tag",
+    "source_attribute",
+    "link_rel",
+    "discovery_count",
+    "crawl_depth",
+    "content_type",
+    "indexable",
+    "indexability_reason",
+    "error",
+]
+
+RESOURCE_CSV_FIELDS = [
+    "url",
+    "status_code",
+    "final_url",
+    "resource_type",
+    "content_type",
+    "source_url",
+    "source_tag",
+    "source_attribute",
+    "link_rel",
+    "discovery_count",
+    "crawl_depth",
+    "indexable",
+    "indexability_reason",
+    "error",
+]
+
 TRACKING_QUERY_NAMES = {"gclid", "fbclid", "msclkid"}
 TRACKING_QUERY_PREFIXES = ("utm_",)
 ALLOWED_SCHEMES = {"http", "https"}
@@ -89,10 +128,10 @@ RESOURCE_EXTENSIONS = {
     ".ttf": "font",
     ".otf": "font",
     ".eot": "font",
-    ".mp3": "media",
-    ".mp4": "media",
-    ".ogg": "media",
-    ".webm": "media",
+    ".mp3": "audio",
+    ".mp4": "video",
+    ".ogg": "audio",
+    ".webm": "video",
 }
 
 
@@ -150,6 +189,12 @@ class CrawlResult:
     indexable: str = ""
     indexability_reason: str = ""
     error: str = ""
+
+
+@dataclass(frozen=True)
+class ReportPaths:
+    pages: Path
+    resources: Path
 
 
 @dataclass
@@ -477,8 +522,10 @@ def classify_resource(
         return "font"
     if mime_type == "application/json" or mime_type.endswith("+json"):
         return "json"
-    if mime_type.startswith(("audio/", "video/")):
-        return "media"
+    if mime_type.startswith("video/"):
+        return "video"
+    if mime_type.startswith("audio/"):
+        return "audio"
     if mime_type:
         return "other"
 
@@ -490,6 +537,8 @@ def classify_resource(
         "javascript",
         "font",
         "json",
+        "audio",
+        "video",
         "media",
     }:
         return reference.resource_hint
@@ -602,8 +651,10 @@ def _source_resource_hint(url: str, content_type: str) -> str:
     lowered_type = content_type.lower()
     if lowered_type.startswith("image/"):
         return "image"
-    if lowered_type.startswith(("audio/", "video/")):
-        return "media"
+    if lowered_type.startswith("audio/"):
+        return "audio"
+    if lowered_type.startswith("video/"):
+        return "video"
     if Path(urlsplit(url).path).suffix.lower() in IMAGE_EXTENSIONS:
         return "image"
     return ""
@@ -723,6 +774,41 @@ def write_csv(results: dict[str, CrawlResult], output_path: str | Path) -> None:
         writer.writeheader()
         for result in results.values():
             writer.writerow({field: getattr(result, field) for field in CSV_FIELDS})
+
+
+def report_paths(output_dir: str | Path) -> ReportPaths:
+    """Return the fixed public report paths beneath an output directory."""
+    directory = Path(output_dir)
+    return ReportPaths(directory / "pages.csv", directory / "resources.csv")
+
+
+def _write_report(
+    results: list[CrawlResult],
+    path: Path,
+    fieldnames: list[str],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in results:
+            writer.writerow({field: getattr(result, field) for field in fieldnames})
+
+
+def write_reports(
+    results: dict[str, CrawlResult], output_dir: str | Path
+) -> ReportPaths:
+    """Write separate HTML page and non-HTML resource audit reports."""
+    paths = report_paths(output_dir)
+    page_results = [
+        result for result in results.values() if result.resource_type == "html"
+    ]
+    resource_results = [
+        result for result in results.values() if result.resource_type != "html"
+    ]
+    _write_report(page_results, paths.pages, PAGE_CSV_FIELDS)
+    _write_report(resource_results, paths.resources, RESOURCE_CSV_FIELDS)
+    return paths
 
 
 def _summary(
