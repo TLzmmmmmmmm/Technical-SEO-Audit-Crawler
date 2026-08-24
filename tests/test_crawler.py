@@ -336,6 +336,50 @@ class ReportWriterTests(unittest.TestCase):
             self.assertEqual(list(resource_reader), [])
 
 
+class SummaryTests(unittest.TestCase):
+    def test_counts_pages_and_resources_without_mixing_page_count(self):
+        results = {
+            "/ok": CrawlResult(
+                "/ok", resource_type="html", indexable="YES", error="html_too_large"
+            ),
+            "/redirect": CrawlResult(
+                "/redirect", status_code=301, resource_type="html", indexable="NO"
+            ),
+            "/image": CrawlResult("/image", resource_type="image"),
+            "/css": CrawlResult("/css", resource_type="css"),
+            "/js": CrawlResult("/js", resource_type="javascript"),
+            "/pdf": CrawlResult("/pdf", resource_type="pdf"),
+            "/font": CrawlResult("/font", resource_type="font"),
+            "/video": CrawlResult("/video", resource_type="video"),
+            "/audio": CrawlResult("/audio", resource_type="audio"),
+            "/json": CrawlResult(
+                "/json", resource_type="json", error="timeout"
+            ),
+        }
+
+        metrics = crawler_module._audit_metrics(results)
+
+        self.assertEqual(metrics.pages_discovered, 2)
+        self.assertEqual(metrics.indexable_pages, 1)
+        self.assertEqual(metrics.non_indexable_pages, 1)
+        self.assertEqual(metrics.page_errors, 1)
+        self.assertEqual(
+            metrics.resource_counts,
+            {
+                "image": 1,
+                "css": 1,
+                "javascript": 1,
+                "pdf": 1,
+                "font": 1,
+                "video": 1,
+                "audio": 1,
+                "other": 1,
+            },
+        )
+        self.assertEqual(metrics.resource_errors, 1)
+        self.assertEqual(metrics.total_unique_urls, 10)
+
+
 class ResourceAuditTests(unittest.TestCase):
     def test_classifies_response_mime_types_and_fallbacks(self):
         cases = [

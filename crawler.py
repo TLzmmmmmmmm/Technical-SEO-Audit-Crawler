@@ -197,6 +197,17 @@ class ReportPaths:
     resources: Path
 
 
+@dataclass(frozen=True)
+class AuditMetrics:
+    pages_discovered: int
+    indexable_pages: int
+    non_indexable_pages: int
+    page_errors: int
+    resource_counts: dict[str, int]
+    resource_errors: int
+    total_unique_urls: int
+
+
 @dataclass
 class CrawlSummary:
     completion_reason: str
@@ -809,6 +820,41 @@ def write_reports(
     _write_report(page_results, paths.pages, PAGE_CSV_FIELDS)
     _write_report(resource_results, paths.resources, RESOURCE_CSV_FIELDS)
     return paths
+
+
+def _audit_metrics(results: dict[str, CrawlResult]) -> AuditMetrics:
+    """Calculate page and resource metrics from finalized crawl results."""
+    pages = [
+        result for result in results.values() if result.resource_type == "html"
+    ]
+    resources = [
+        result for result in results.values() if result.resource_type != "html"
+    ]
+    resource_counts = {
+        "image": 0,
+        "css": 0,
+        "javascript": 0,
+        "pdf": 0,
+        "font": 0,
+        "video": 0,
+        "audio": 0,
+        "other": 0,
+    }
+    for result in resources:
+        category = result.resource_type
+        if category not in resource_counts or category == "other":
+            category = "other"
+        resource_counts[category] += 1
+
+    return AuditMetrics(
+        pages_discovered=len(pages),
+        indexable_pages=sum(result.indexable == "YES" for result in pages),
+        non_indexable_pages=sum(result.indexable == "NO" for result in pages),
+        page_errors=sum(bool(result.error) for result in pages),
+        resource_counts=resource_counts,
+        resource_errors=sum(bool(result.error) for result in resources),
+        total_unique_urls=len(results),
+    )
 
 
 def _summary(
