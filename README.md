@@ -1,6 +1,6 @@
 # Technical SEO Audit Crawler
 
-[![Tests](https://github.com/TLzmmmmmmmm/Web_Crawler_Practice/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/TLzmmmmmmmm/Web_Crawler_Practice/actions/workflows/tests.yml)
+[![Tests](https://github.com/TLzmmmmmmmm/Technical-SEO-Audit-Crawler/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/TLzmmmmmmmm/Technical-SEO-Audit-Crawler/actions/workflows/tests.yml)
 
 A technical SEO crawler that follows internal HTML pages breadth-first, audits
 referenced resources, and generates separate Page Audit and Resource Audit
